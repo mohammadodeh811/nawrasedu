@@ -1,0 +1,10 @@
+{
+  "name": "NAWRAS EDU",
+  "short_name": "NAWRAS EDU",
+  "description": "NAWRAS EDU learning community, courses, schedules, forms, and team resources.",
+  "start_url": "/index.html",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f7f4ef",
+  "theme_color": "#f7f4ef"
+}

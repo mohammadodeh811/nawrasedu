@@ -1,0 +1,1274 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function member() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/teamMembers/$(request.auth.uid))
+        && get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.active == true;
+    }
+
+    function roleIs(role) {
+      return member()
+        && get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.role == role;
+    }
+
+    function dashboardGrantActive(grantId) {
+      return exists(/databases/$(database)/documents/dashboardAccessGrants/$(grantId))
+        && get(/databases/$(database)/documents/dashboardAccessGrants/$(grantId)).data.get("active", false) == true;
+    }
+
+    function matchesDashboardGrantId(grantId, scopePrefix, target) {
+      return grantId == scopePrefix + target + "_formsManage"
+        || grantId == scopePrefix + target + "_formsRead"
+        || grantId == scopePrefix + target + "_formsResponses"
+        || grantId == scopePrefix + target + "_coursesManage"
+        || grantId == scopePrefix + target + "_coursesRead"
+        || grantId == scopePrefix + target + "_technicalMaterialsManage"
+        || grantId == scopePrefix + target + "_technicalMaterialsRead"
+        || grantId == scopePrefix + target + "_designerResourcesRead";
+    }
+
+    function canGetCurrentMemberDashboardGrant(grantId) {
+      return member() && (
+        matchesDashboardGrantId(grantId, "user_", request.auth.uid)
+        || matchesDashboardGrantId(grantId, "role_", memberRole())
+        || (get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get("universityTag", "") != ""
+          && matchesDashboardGrantId(
+            grantId,
+            "university_",
+            get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get("universityTag", "")
+          ))
+      );
+    }
+
+    function hasDashboardAccess(capability) {
+      return member() && (
+        roleIs("admin")
+        || dashboardGrantActive("user_" + request.auth.uid + "_" + capability)
+        || dashboardGrantActive("role_" + memberRole() + "_" + capability)
+        || (get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get("universityTag", "") != ""
+          && dashboardGrantActive("university_" + get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get("universityTag", "") + "_" + capability))
+      );
+    }
+
+    function technicalAccessGrantMatchesMember(grantId, uid) {
+      let grant = get(/databases/$(database)/documents/dashboardAccessGrants/$(grantId)).data;
+      let profile = get(/databases/$(database)/documents/teamMembers/$(uid)).data;
+      return grant.get("active", false) == true
+        && grant.get("capability", "") in ["technicalMaterialsRead", "technicalMaterialsManage"]
+        && ((grant.scopeType == "user" && grant.scopeTarget == uid)
+          || (grant.scopeType == "role" && grant.scopeTarget == profile.get("role", ""))
+          || (grant.scopeType == "university" && grant.scopeTarget == profile.get("universityTag", "")));
+    }
+
+    function dashboardAccessNotificationMatchesMember(uid) {
+      return exists(/databases/$(database)/documents/teamMembers/$(uid))
+        && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true
+        && (
+          (request.resource.data.accessScopeType == "user"
+            && request.resource.data.accessScopeTarget == uid)
+          || (request.resource.data.accessScopeType == "role"
+            && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "") == request.resource.data.accessScopeTarget)
+          || (request.resource.data.accessScopeType == "university"
+            && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("universityTag", "") == request.resource.data.accessScopeTarget)
+        );
+    }
+
+    function sessionAudienceMatchesMember(session, uid) {
+      return exists(/databases/$(database)/documents/teamMembers/$(uid))
+        && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true
+        && (session.get("targetMemberUids", []).hasAny([uid])
+          || ((session.get("audienceRole", "") == "all"
+              || session.get("audienceRole", "") == get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", ""))
+            && (session.get("audienceUniversityTag", "") == ""
+              || session.get("audienceUniversityTag", "") == get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("universityTag", ""))));
+    }
+
+    function taskAudienceMatchesMember(task, uid) {
+      return exists(/databases/$(database)/documents/teamMembers/$(uid))
+        && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true
+        && (get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "") == task.get("targetRole", "")
+          || (get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "") == "admin"
+            && (task.get("targetRole", "") == "admin"
+              || get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("adminTeamAssignment", "") == "member:" + task.get("targetRole", "")
+              || get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("adminTeamAssignment", "") == "leader:" + task.get("targetRole", ""))));
+    }
+
+    function contentManager() {
+      return roleIs("admin") || roleIs("tech");
+    }
+
+    function courseManager() {
+      return contentManager() || hasDashboardAccess("coursesManage");
+    }
+
+    function courseReader() {
+      return courseManager() || hasDashboardAccess("coursesRead");
+    }
+
+    function formManager() {
+      return contentManager() || roleIs("public") || hasDashboardAccess("formsManage");
+    }
+
+    function validQuestionRole(role) {
+      return role == "leaders"
+        || role == "public"
+        || role == "tech"
+        || role == "social"
+        || role == "designers"
+        || role == "content"
+        || role == "event";
+    }
+
+    function validSocialLinks(links) {
+      return links is map
+        && links.keys().hasOnly(["instagram", "facebook", "github", "linkedin", "youtube", "tiktok", "x", "website"])
+        && (!links.keys().hasAny(["instagram"]) || (links.instagram is string && links.instagram.size() <= 500 && links.instagram.matches("^https://([a-z0-9-]+[.])*(instagram[.]com)/[^\\s]*$")))
+        && (!links.keys().hasAny(["facebook"]) || (links.facebook is string && links.facebook.size() <= 500 && links.facebook.matches("^https://([a-z0-9-]+[.])*(facebook[.]com|fb[.]com)/[^\\s]*$")))
+        && (!links.keys().hasAny(["github"]) || (links.github is string && links.github.size() <= 500 && links.github.matches("^https://([a-z0-9-]+[.])*(github[.]com)/[^\\s]*$")))
+        && (!links.keys().hasAny(["linkedin"]) || (links.linkedin is string && links.linkedin.size() <= 500 && links.linkedin.matches("^https://([a-z0-9-]+[.])*(linkedin[.]com)/[^\\s]*$")))
+        && (!links.keys().hasAny(["youtube"]) || (links.youtube is string && links.youtube.size() <= 500 && links.youtube.matches("^https://([a-z0-9-]+[.])*(youtube[.]com|youtu[.]be)/[^\\s]*$")))
+        && (!links.keys().hasAny(["tiktok"]) || (links.tiktok is string && links.tiktok.size() <= 500 && links.tiktok.matches("^https://([a-z0-9-]+[.])*(tiktok[.]com)/[^\\s]*$")))
+        && (!links.keys().hasAny(["x"]) || (links.x is string && links.x.size() <= 500 && links.x.matches("^https://([a-z0-9-]+[.])*(x[.]com|twitter[.]com)/[^\\s]*$")))
+        && (!links.keys().hasAny(["website"]) || (links.website is string && links.website.size() <= 500 && links.website.matches("^https://[a-z0-9-]+([.][a-z0-9-]+)+/[^\\s]*$")));
+    }
+
+    function validUniversityTag(tag) {
+      return tag == ""
+        || tag == "AAUP-Jenin"
+        || tag == "AAUP-Ramallah"
+        || tag == "BZU"
+        || tag == "NNU"
+        || tag == "PPU"
+        || tag == "PTUK";
+    }
+
+    function validAdminTeamAssignment(assignment) {
+      return assignment is string && assignment in [
+        "", "member:user", "member:leaders", "member:public", "member:tech",
+        "member:social", "member:designers", "member:content", "member:event",
+        "leader:user", "leader:leaders", "leader:public", "leader:tech",
+        "leader:social", "leader:designers", "leader:content", "leader:event"
+      ];
+    }
+
+    function leadsTeamRole(targetRole) {
+      return member()
+        && get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get("teamLeadRoles", []) is list
+        && get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get("teamLeadRoles", []).hasAny([targetRole]);
+    }
+
+    function canManageTeamMember(uid) {
+      return roleIs("admin")
+        || (roleIs("leaders")
+          && request.auth.uid != uid
+          && exists(/databases/$(database)/documents/teamMembers/$(uid))
+          && get(/databases/$(database)/documents/teamMembers/$(uid)).data.active == true
+          && get(/databases/$(database)/documents/teamMembers/$(uid)).data.role != "admin"
+          && get(/databases/$(database)/documents/teamMembers/$(uid)).data.universityTag
+            == get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.leadingUniversityTag
+          && get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.leadingUniversityTag != "")
+        || (request.auth.uid != uid
+          && exists(/databases/$(database)/documents/teamMembers/$(uid))
+          && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true
+          && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "") != "admin"
+          && leadsTeamRole(get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "")));
+    }
+
+    function validRatingScores(scores) {
+      return scores is map
+        && scores.keys().hasOnly(["commitment", "projects", "participation", "initiative", "teamwork", "quality"])
+        && scores.get("commitment", 0) is int && scores.get("commitment", 0) >= 0 && scores.get("commitment", 0) <= 100
+        && scores.get("projects", 0) is int && scores.get("projects", 0) >= 0 && scores.get("projects", 0) <= 100
+        && scores.get("participation", 0) is int && scores.get("participation", 0) >= 0 && scores.get("participation", 0) <= 100
+        && scores.get("initiative", 0) is int && scores.get("initiative", 0) >= 0 && scores.get("initiative", 0) <= 100
+        && scores.get("teamwork", 0) is int && scores.get("teamwork", 0) >= 0 && scores.get("teamwork", 0) <= 100
+        && scores.get("quality", 0) is int && scores.get("quality", 0) >= 0 && scores.get("quality", 0) <= 100;
+    }
+
+    function validRatingNotes(notes) {
+      return notes is map
+        && notes.keys().hasOnly(["commitment", "projects", "participation", "initiative", "teamwork", "quality"])
+        && notes.get("commitment", "") is string && notes.get("commitment", "").size() <= 500
+        && notes.get("projects", "") is string && notes.get("projects", "").size() <= 500
+        && notes.get("participation", "") is string && notes.get("participation", "").size() <= 500
+        && notes.get("initiative", "") is string && notes.get("initiative", "").size() <= 500
+        && notes.get("teamwork", "") is string && notes.get("teamwork", "").size() <= 500
+        && notes.get("quality", "") is string && notes.get("quality", "").size() <= 500;
+    }
+
+    function canAnswerQuestion(targetRole) {
+      return member()
+        && (roleIs("admin")
+          || get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.role == targetRole);
+    }
+
+    function memberRole() {
+      return get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.role;
+    }
+
+    function formUniversityTargetMatches(targetTag, memberTag) {
+      return (targetTag == "all" && validUniversityTag(memberTag))
+        || (targetTag != "all" && targetTag != "" && targetTag == memberTag);
+    }
+
+    function canReadForm(formData) {
+      return formManager()
+        || formData.get("audienceType", "public") == "public"
+        || (member() && (
+          (formData.get("audienceType", "") == "role"
+            && (formData.get("targetRole", "") == "all"
+              || formData.get("targetRole", "") == memberRole()))
+          || (formData.get("audienceType", "") == "university"
+            && formUniversityTargetMatches(
+              formData.get("targetUniversityTag", ""),
+              get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get("universityTag", "")
+            ))
+          || (formData.get("audienceType", "") == "leader_university"
+            && roleIs("leaders")
+            && formUniversityTargetMatches(
+              formData.get("targetUniversityTag", ""),
+              get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get("leadingUniversityTag", "")
+            ))
+        ));
+    }
+
+    function formAudienceMatchesUser(formData, uid) {
+      return exists(/databases/$(database)/documents/teamMembers/$(uid))
+        && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true
+        && (
+          (formData.get("audienceType", "") == "role"
+            && (formData.get("targetRole", "") == "all"
+              || formData.get("targetRole", "") == get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "")))
+          || (formData.get("audienceType", "") == "university"
+            && formUniversityTargetMatches(
+              formData.get("targetUniversityTag", ""),
+              get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("universityTag", "")
+            ))
+          || (formData.get("audienceType", "") == "leader_university"
+            && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "") == "leaders"
+            && formUniversityTargetMatches(
+              formData.get("targetUniversityTag", ""),
+              get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("leadingUniversityTag", "")
+            ))
+        );
+    }
+
+    function validTaskMode(mode) {
+      return mode == "all" || mode == "first" || mode == "free";
+    }
+
+    function validTaskRole(role) {
+      return role == "admin" || role == "user" || validQuestionRole(role);
+    }
+
+    function validLinkEntry(link) {
+      return link is map
+        && link.keys().hasAll(["label", "url"])
+        && link.keys().hasOnly(["label", "url"])
+        && link.label is string
+        && link.label.size() >= 1
+        && link.label.size() <= 60
+        && link.url is string
+        && link.url.size() <= 1000
+        && link.url.matches("^https?://.+");
+    }
+
+    function validLinkEntries(data) {
+      return !data.keys().hasAny(["links"])
+        || (data.links is list
+          && data.links.size() <= 3
+          && (data.links.size() < 1 || validLinkEntry(data.links[0]))
+          && (data.links.size() < 2 || validLinkEntry(data.links[1]))
+          && (data.links.size() < 3 || validLinkEntry(data.links[2])));
+    }
+
+    // Optional task assets: up to 6 { label, url } links.
+    function validTaskAssets(data) {
+      return !data.keys().hasAny(["assets"])
+        || (data.assets is list
+          && data.assets.size() <= 6
+          && (data.assets.size() < 1 || validLinkEntry(data.assets[0]))
+          && (data.assets.size() < 2 || validLinkEntry(data.assets[1]))
+          && (data.assets.size() < 3 || validLinkEntry(data.assets[2]))
+          && (data.assets.size() < 4 || validLinkEntry(data.assets[3]))
+          && (data.assets.size() < 5 || validLinkEntry(data.assets[4]))
+          && (data.assets.size() < 6 || validLinkEntry(data.assets[5])));
+    }
+
+    // Optional interactive page: "" (none), "url" (hosted page) or "html" (inline HTML).
+    function validTaskGame(data) {
+      return data.get("gameType", "") in ["", "url", "html"]
+        && data.get("gameUrl", "") is string
+        && data.get("gameUrl", "").size() <= 1000
+        && (data.get("gameUrl", "") == "" || data.get("gameUrl", "").matches("^https?://.+"))
+        && data.get("gameHtml", "") is string
+        && data.get("gameHtml", "").size() <= 500000
+        && (data.get("gameType", "") != "url" || data.get("gameUrl", "") != "")
+        && (data.get("gameType", "") != "html" || data.get("gameHtml", "").size() >= 20);
+    }
+
+    // Optional result reported by the interactive page when the member finishes.
+    function validGameResult(data) {
+      return !data.keys().hasAny(["gameResult"])
+        || (data.gameResult is map
+          && data.gameResult.keys().hasOnly(["completedAtClient", "score", "maxScore", "summary", "details"])
+          && data.gameResult.get("completedAtClient", "") is string
+          && data.gameResult.get("completedAtClient", "").size() <= 40
+          && data.gameResult.get("score", 0) is number
+          && data.gameResult.get("maxScore", 0) is number
+          && data.gameResult.get("summary", "") is string
+          && data.gameResult.get("summary", "").size() <= 500
+          && data.gameResult.get("details", "") is string
+          && data.gameResult.get("details", "").size() <= 2000);
+    }
+
+    function adminAssignedToTaskRole(targetRole) {
+      let assignment = get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get("adminTeamAssignment", "");
+      return roleIs("admin") && (
+        (targetRole == "user" && assignment in ["member:user", "leader:user"])
+        || (targetRole == "leaders" && assignment in ["member:leaders", "leader:leaders"])
+        || (targetRole == "public" && assignment in ["member:public", "leader:public"])
+        || (targetRole == "tech" && assignment in ["member:tech", "leader:tech"])
+        || (targetRole == "social" && assignment in ["member:social", "leader:social"])
+        || (targetRole == "designers" && assignment in ["member:designers", "leader:designers"])
+        || (targetRole == "content" && assignment in ["member:content", "leader:content"])
+        || (targetRole == "event" && assignment in ["member:event", "leader:event"])
+      );
+    }
+
+    function canSubmitTask(task) {
+      return member()
+        && (task.targetRole == memberRole()
+          || (roleIs("admin") && task.targetRole == "admin")
+          || adminAssignedToTaskRole(task.targetRole));
+    }
+
+    function canReadTask(task) {
+      return roleIs("admin") || (member() && task.targetRole == memberRole());
+    }
+
+    function validChatParticipant(chat) {
+      return exists(/databases/$(database)/documents/teamMembers/$(chat.memberUid))
+        && exists(/databases/$(database)/documents/teamMembers/$(chat.leaderUid))
+        && get(/databases/$(database)/documents/teamMembers/$(chat.memberUid)).data.active == true
+        && get(/databases/$(database)/documents/teamMembers/$(chat.leaderUid)).data.active == true
+        && get(/databases/$(database)/documents/teamMembers/$(chat.leaderUid)).data.role == "leaders"
+        && get(/databases/$(database)/documents/teamMembers/$(chat.leaderUid)).data.leadingUniversityTag == chat.universityTag
+        && get(/databases/$(database)/documents/teamMembers/$(chat.memberUid)).data.universityTag == chat.universityTag;
+    }
+
+    function chatParticipant(chat) {
+      return member()
+        && validChatParticipant(chat)
+        && (chat.memberUid == request.auth.uid || chat.leaderUid == request.auth.uid);
+    }
+
+    function sessionManager() {
+      return roleIs("admin") || roleIs("leaders");
+    }
+
+    function canAccessOnlineSession(session) {
+      return member()
+        && (sessionManager()
+          || session.get("targetMemberUids", []).hasAny([request.auth.uid])
+          || ((session.audienceRole == "all"
+              || session.audienceRole == memberRole())
+            && (!session.keys().hasAny(["audienceUniversityTag"])
+              || session.audienceUniversityTag == ""
+              || session.audienceUniversityTag == get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.universityTag)));
+    }
+
+    function validOnlineAudience(audienceRole) {
+      return audienceRole == "all"
+        || audienceRole == "targeted"
+        || audienceRole == "user"
+        || audienceRole == "leaders"
+        || audienceRole == "public"
+        || audienceRole == "tech"
+        || audienceRole == "social"
+        || audienceRole == "designers"
+        || audienceRole == "content"
+        || audienceRole == "event";
+    }
+
+    function onlineScheduleMatchesSession(sessionId, expectedStatus) {
+      return existsAfter(/databases/$(database)/documents/nawrasOnlineSessions/$(sessionId))
+        && getAfter(/databases/$(database)/documents/nawrasOnlineSessions/$(sessionId)).data.status == expectedStatus;
+    }
+
+    function validPublicCourse(data) {
+      return data.keys().hasAll(["published", "publicVisible"])
+        && data.published is bool
+        && data.publicVisible is bool
+        && data.publicVisible == data.published
+        && !data.keys().hasAny(["assets", "assignedMemberUids"]);
+    }
+
+    function validCoursePrivateData(data) {
+      return data.keys().hasAll(["assets"])
+        && data.keys().hasOnly(["assets"])
+        && data.assets is list
+        && data.assets.size() <= 24;
+    }
+
+    function validCourseAssignment(assignmentId, data) {
+      return data.keys().hasAll(["courseId", "memberUid", "assignedAt"])
+        && data.keys().hasOnly(["courseId", "memberUid", "assignedAt"])
+        && data.courseId is string
+        && data.memberUid is string
+        && data.assignedAt is timestamp
+        && data.assignedAt == request.time
+        && assignmentId == data.courseId + "_" + data.memberUid;
+    }
+
+    function validTechnicalMaterial(data) {
+      return data.keys().hasAll([
+          "title", "kind", "description", "url", "createdAt", "createdByUid", "createdByName"
+        ])
+        && data.keys().hasOnly([
+          "title", "kind", "description", "url", "createdAt", "createdByUid", "createdByName"
+        ])
+        && data.title is string
+        && data.title.size() >= 1
+        && data.title.size() <= 120
+        && data.kind in ["video", "lecture", "book", "material"]
+        && data.description is string
+        && data.description.size() <= 1200
+        && data.url is string
+        && data.url.size() <= 1500
+        && data.url.matches("^https://(drive[.]google[.]com|docs[.]google[.]com)/[^\\s]+$")
+        && data.createdAt is timestamp
+        && data.createdAt == request.time
+        && data.createdByUid == request.auth.uid
+        && data.createdByName is string
+        && data.createdByName.size() <= 80;
+    }
+
+    match /courses/{courseId} {
+      allow read: if courseReader()
+        || resource.data.publicVisible == true
+        || (member()
+          && exists(/databases/$(database)/documents/courseAssignments/$(courseId + "_" + request.auth.uid)));
+      allow create, update: if courseManager() && validPublicCourse(request.resource.data);
+      allow delete: if courseManager();
+    }
+
+    // Course lessons and materials are private; published course metadata stays public.
+    match /coursePrivate/{courseId} {
+      allow read: if courseReader()
+        || (member()
+          && exists(/databases/$(database)/documents/courseAssignments/$(courseId + "_" + request.auth.uid)));
+      allow create, update: if courseManager() && validCoursePrivateData(request.resource.data);
+      allow delete: if courseManager();
+    }
+
+    // Assignments are queried by memberUid and never exposed to public visitors.
+    match /courseAssignments/{assignmentId} {
+      allow read: if courseManager()
+        || (member() && resource.data.memberUid == request.auth.uid);
+      allow create, update: if courseManager()
+        && validCourseAssignment(assignmentId, request.resource.data);
+      allow delete: if courseManager();
+    }
+
+    match /dashboardAccessGrants/{grantId} {
+      function validAccessGrant(data) {
+        return data.keys().hasAll([
+            "scopeType", "scopeTarget", "capability", "active", "updatedByUid", "updatedAt"
+          ])
+          && data.keys().hasOnly([
+            "scopeType", "scopeTarget", "capability", "active", "updatedByUid", "updatedAt"
+          ])
+          && data.scopeType in ["role", "university", "user"]
+          && data.scopeTarget is string
+          && data.scopeTarget.size() >= 1
+          && data.scopeTarget.size() <= 128
+          && data.capability in [
+            "formsManage", "formsRead", "formsResponses", "coursesManage", "coursesRead",
+            "technicalMaterialsManage", "technicalMaterialsRead", "designerResourcesRead"
+          ]
+          && data.active == true
+          && data.updatedByUid == request.auth.uid
+          && data.updatedAt == request.time
+          && grantId == data.scopeType + "_" + data.scopeTarget + "_" + data.capability
+          && (
+            (data.scopeType == "role"
+              && data.scopeTarget in ["user", "leaders", "public", "tech", "social", "designers", "content", "event"])
+            || (data.scopeType == "university" && validUniversityTag(data.scopeTarget))
+            || (data.scopeType == "user"
+              && exists(/databases/$(database)/documents/teamMembers/$(data.scopeTarget))
+              && get(/databases/$(database)/documents/teamMembers/$(data.scopeTarget)).data.get("role", "") != "admin")
+          );
+      }
+
+      allow get: if roleIs("admin") || canGetCurrentMemberDashboardGrant(grantId)
+        || (hasDashboardAccess("technicalMaterialsManage")
+          && resource.data.capability in ["technicalMaterialsRead", "technicalMaterialsManage"]);
+      allow list: if roleIs("admin")
+        || (hasDashboardAccess("technicalMaterialsManage")
+          && resource.data.capability in ["technicalMaterialsRead", "technicalMaterialsManage"])
+        || (member()
+          && resource.data.active == true
+          && (
+            (resource.data.scopeType == "user" && resource.data.scopeTarget == request.auth.uid)
+            || (resource.data.scopeType == "role" && resource.data.scopeTarget == memberRole())
+            || (resource.data.scopeType == "university"
+              && resource.data.scopeTarget == get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get("universityTag", ""))
+          ));
+      allow create, update: if roleIs("admin") && validAccessGrant(request.resource.data);
+      allow delete: if roleIs("admin");
+    }
+
+    match /technicalMaterials/{materialId} {
+      allow read: if roleIs("admin") || roleIs("tech") || hasDashboardAccess("technicalMaterialsRead") || hasDashboardAccess("technicalMaterialsManage");
+      allow create: if (roleIs("admin") || hasDashboardAccess("technicalMaterialsManage")) && validTechnicalMaterial(request.resource.data);
+      allow update: if false;
+      allow delete: if roleIs("admin") || hasDashboardAccess("technicalMaterialsManage");
+    }
+
+    match /forms/{formId} {
+      allow read: if formManager()
+        || hasDashboardAccess("formsRead")
+        || hasDashboardAccess("formsResponses")
+        || (resource.data.published == true && canReadForm(resource.data));
+      allow create, update: if formManager();
+      allow delete: if formManager();
+
+      match /responses/{responseId} {
+        allow create: if get(/databases/$(database)/documents/forms/$(formId)).data.published == true
+          && canReadForm(get(/databases/$(database)/documents/forms/$(formId)).data);
+        allow read: if formManager() || hasDashboardAccess("formsResponses");
+        allow update, delete: if contentManager();
+      }
+    }
+
+    // Retired public schedule. Preserve old data for admin-only archival cleanup.
+    // Personal calendars use the protected NawrasOnline records directly.
+    match /schedule/{sessionId} {
+      allow read, delete: if roleIs("admin");
+      allow create, update: if false;
+    }
+
+    // NawrasOnline rooms are visible only to active members in the selected
+    // audience. Admins and leaders can create sessions and moderate them.
+    match /nawrasOnlineSessions/{sessionId} {
+      allow read: if canAccessOnlineSession(resource.data);
+      allow create: if sessionManager()
+        && request.resource.data.keys().hasAll([
+          "title", "description", "audienceRole", "startsAt", "createdBy",
+          "createdByName", "audienceUniversityTag", "status", "createdAt", "updatedAt"
+        ])
+        && request.resource.data.keys().hasOnly([
+          "title", "description", "audienceRole", "startsAt", "createdBy",
+          "createdByName", "audienceUniversityTag", "status", "createdAt", "updatedAt",
+          "targetMemberUids", "endsAt"
+        ])
+        && request.resource.data.get("targetMemberUids", []) is list
+        && request.resource.data.get("targetMemberUids", []).size() <= 100
+        && (request.resource.data.audienceRole != "targeted"
+          || request.resource.data.get("targetMemberUids", []).size() > 0)
+        && (!request.resource.data.keys().hasAny(["endsAt"])
+          || (request.resource.data.endsAt is timestamp
+            && request.resource.data.endsAt > request.resource.data.startsAt
+            && request.resource.data.endsAt <= request.resource.data.startsAt + duration.value(8, "h")))
+        && request.resource.data.title is string
+        && request.resource.data.title.size() >= 3
+        && request.resource.data.title.size() <= 100
+        && request.resource.data.description is string
+        && request.resource.data.description.size() <= 1000
+        && validOnlineAudience(request.resource.data.audienceRole)
+        && validUniversityTag(request.resource.data.audienceUniversityTag)
+        && request.resource.data.startsAt is timestamp
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdByName is string
+        && request.resource.data.createdByName.size() >= 1
+        && request.resource.data.createdByName.size() <= 80
+        && request.resource.data.status == "scheduled"
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time;
+      allow update: if (
+          sessionManager()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["status", "updatedAt", "endedAt", "expiresAt"])
+          && request.resource.data.updatedAt == request.time
+          && (
+            (resource.data.status == "scheduled"
+              && request.resource.data.status in ["live", "cancelled"]
+              && !request.resource.data.keys().hasAny(["endedAt", "expiresAt"]))
+            || (resource.data.status == "live"
+              && request.resource.data.status == "cancelled"
+              && !request.resource.data.keys().hasAny(["endedAt", "expiresAt"]))
+            || (resource.data.status == "live"
+              && request.resource.data.status == "ended"
+              && request.resource.data.endedAt == request.time
+              && request.resource.data.expiresAt is timestamp
+              && request.resource.data.expiresAt > request.time)
+          )
+        ) || (
+          roleIs("admin")
+          && !resource.data.keys().hasAny(["audienceUniversityTag"])
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["audienceUniversityTag"])
+          && request.resource.data.audienceUniversityTag == ""
+        );
+      allow delete: if roleIs("admin") && resource.data.status == "ended";
+
+      match /hands/{uid} {
+        function parentSession() {
+          return get(/databases/$(database)/documents/nawrasOnlineSessions/$(sessionId)).data;
+        }
+
+        allow read: if canAccessOnlineSession(parentSession());
+        allow create: if canAccessOnlineSession(parentSession())
+          && parentSession().status in ["scheduled", "live"]
+          && uid == request.auth.uid
+          && request.resource.data.keys().hasAll(["uid", "displayName", "raisedAt"])
+          && request.resource.data.keys().hasOnly(["uid", "displayName", "raisedAt"])
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.displayName is string
+          && request.resource.data.displayName.size() >= 1
+          && request.resource.data.displayName.size() <= 80
+          && request.resource.data.raisedAt == request.time;
+        allow delete: if canAccessOnlineSession(parentSession())
+          && (uid == request.auth.uid || sessionManager());
+        allow update: if false;
+      }
+
+      // Original room visits are append-only until an admin deletes an ended room. A member may open their own visit
+      // and close it once; only admins can inspect the resulting attendance log.
+      match /attendanceVisits/{visitId} {
+        function parentSession() {
+          return get(/databases/$(database)/documents/nawrasOnlineSessions/$(sessionId)).data;
+        }
+
+        allow read: if roleIs("admin");
+        allow create: if canAccessOnlineSession(parentSession())
+          && parentSession().status in ["scheduled", "live"]
+          && request.resource.data.keys().hasAll([
+            "uid", "displayName", "email", "enteredAt", "leftAt", "timeZone"
+          ])
+          && request.resource.data.keys().hasOnly([
+            "uid", "displayName", "email", "enteredAt", "leftAt", "timeZone"
+          ])
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.displayName is string
+          && request.resource.data.displayName.size() >= 1
+          && request.resource.data.displayName.size() <= 80
+          && request.resource.data.email is string
+          && request.resource.data.email == request.auth.token.email
+          && request.resource.data.email.size() <= 254
+          && request.resource.data.enteredAt == request.time
+          && request.resource.data.leftAt == null
+          && request.resource.data.timeZone is string
+          && request.resource.data.timeZone.size() <= 100;
+        allow update: if canAccessOnlineSession(parentSession())
+          && resource.data.uid == request.auth.uid
+          && resource.data.leftAt == null
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["leftAt"])
+          && request.resource.data.leftAt == request.time;
+        // Only an active admin may erase history, and only for an ended room.
+        allow delete: if roleIs("admin")
+          && get(/databases/$(database)/documents/nawrasOnlineSessions/$(sessionId)).data.status == "ended";
+      }
+
+      // Admin overrides and notes are kept separate from immutable visit logs.
+      match /attendance/{uid} {
+        function validAttendanceOverride(data) {
+          return data.keys().hasAll([
+              "uid", "statusOverride", "notes", "updatedBy", "updatedAt"
+            ])
+            && data.keys().hasOnly([
+              "uid", "statusOverride", "notes", "updatedBy", "updatedAt"
+            ])
+            && data.statusOverride in ["auto", "attended", "absent", "excused"]
+            && data.notes is string
+            && data.notes.size() <= 2000
+            && data.updatedBy == request.auth.uid
+            && data.updatedAt == request.time;
+        }
+
+        allow read: if roleIs("admin");
+        allow create: if roleIs("admin")
+          && uid == request.resource.data.uid
+          && validAttendanceOverride(request.resource.data);
+        allow update: if roleIs("admin")
+          && uid == resource.data.uid
+          && uid == request.resource.data.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "statusOverride", "notes", "updatedBy", "updatedAt"
+          ])
+          && validAttendanceOverride(request.resource.data);
+        // Only an active admin may erase history, and only for an ended room.
+        allow delete: if roleIs("admin")
+          && get(/databases/$(database)/documents/nawrasOnlineSessions/$(sessionId)).data.status == "ended";
+      }
+    }
+
+    match /questions/{questionId} {
+      allow create: if signedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.status == "open"
+        && request.resource.data.answered == false
+        && validQuestionRole(request.resource.data.targetRole)
+        && request.resource.data.question is string
+        && request.resource.data.question.size() >= 8
+        && request.resource.data.question.size() <= 1000
+        && request.resource.data.createdAt == request.time;
+      allow read: if resource.data.status == "answered"
+        || (signedIn() && resource.data.ownerUid == request.auth.uid)
+        || canAnswerQuestion(resource.data.targetRole);
+      allow update: if canAnswerQuestion(resource.data.targetRole)
+        && resource.data.status == "open"
+        // Keeps questions created by the previous version answerable.
+        && (!resource.data.keys().hasAll(["answered"]) || resource.data.answered == false)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "status", "answered", "answer", "links", "answeredAt", "answeredByUid",
+          "answeredByName", "answeredByPhotoURL", "answeredByRole", "answeredByLevel"
+        ])
+        && request.resource.data.status == "answered"
+        && request.resource.data.answered == true
+        && request.resource.data.question == resource.data.question
+        && request.resource.data.targetRole == resource.data.targetRole
+        && request.resource.data.get("ownerUid", "") == resource.data.get("ownerUid", "")
+        && request.resource.data.answeredByUid == request.auth.uid
+        && request.resource.data.answer is string
+        && request.resource.data.answer.size() >= 8
+        && request.resource.data.answer.size() <= 1500
+        && validLinkEntries(request.resource.data);
+      allow delete: if roleIs("admin");
+    }
+
+    match /tasks/{taskId} {
+      allow read: if canReadTask(resource.data);
+      allow create: if roleIs("admin")
+        && request.resource.data.keys().hasAll([
+          "title", "description", "targetRole", "mode", "xp", "status",
+          "submissionCount", "claimedByUid", "createdBy", "createdAt", "updatedAt"
+        ])
+        && request.resource.data.keys().hasOnly([
+          "title", "description", "targetRole", "mode", "xp", "status",
+          "submissionCount", "claimedByUid", "createdBy", "createdAt", "updatedAt",
+          "assets", "gameType", "gameUrl", "gameHtml"
+        ])
+        && validTaskAssets(request.resource.data)
+        && validTaskGame(request.resource.data)
+        && request.resource.data.title is string
+        && request.resource.data.title.size() >= 3
+        && request.resource.data.title.size() <= 120
+        && request.resource.data.description is string
+        && request.resource.data.description.size() >= 8
+        && request.resource.data.description.size() <= 1200
+        && validTaskRole(request.resource.data.targetRole)
+        && validTaskMode(request.resource.data.mode)
+        && request.resource.data.xp is int
+        && request.resource.data.xp >= 1
+        && request.resource.data.xp <= 100000
+        && request.resource.data.status == "open"
+        && request.resource.data.submissionCount == 0
+        && request.resource.data.claimedByUid == ""
+        && request.resource.data.createdBy == request.auth.uid;
+      allow update: if (
+          roleIs("admin")
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "title", "description", "targetRole", "mode", "xp", "status", "updatedAt",
+            "assets", "gameType", "gameUrl", "gameHtml"
+          ])
+          && validTaskAssets(request.resource.data)
+          && validTaskGame(request.resource.data)
+          && request.resource.data.title is string
+          && request.resource.data.title.size() >= 3
+          && request.resource.data.title.size() <= 120
+          && request.resource.data.description is string
+          && request.resource.data.description.size() >= 8
+          && request.resource.data.description.size() <= 1200
+          && validTaskRole(request.resource.data.targetRole)
+          && validTaskMode(request.resource.data.mode)
+          && request.resource.data.xp is int
+          && request.resource.data.xp >= 1
+          && request.resource.data.xp <= 100000
+          && (request.resource.data.status == "open" || request.resource.data.status == "closed" || request.resource.data.status == "claimed")
+        ) || (
+          canSubmitTask(resource.data)
+          && resource.data.status == "open"
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "submissionCount", "claimedByUid", "status", "updatedAt"
+          ])
+          && request.resource.data.submissionCount == resource.data.submissionCount + 1
+           && getAfter(/databases/$(database)/documents/tasks/$(taskId)/submissions/$(request.auth.uid)).data.submitterUid == request.auth.uid
+           && getAfter(/databases/$(database)/documents/tasks/$(taskId)/submissions/$(request.auth.uid)).data.status == "pending"
+           && getAfter(/databases/$(database)/documents/tasks/$(taskId)/submissions/$(request.auth.uid)).data.xpAwarded == 0
+           && request.resource.data.claimedByUid == resource.data.claimedByUid
+           && request.resource.data.status == resource.data.status
+        );
+      allow delete: if roleIs("admin");
+
+      match /submissions/{uid} {
+        allow read: if roleIs("admin")
+          || (member() && uid == request.auth.uid && canSubmitTask(get(/databases/$(database)/documents/tasks/$(taskId)).data));
+        allow create: if member()
+          && uid == request.auth.uid
+          && canSubmitTask(get(/databases/$(database)/documents/tasks/$(taskId)).data)
+          && get(/databases/$(database)/documents/tasks/$(taskId)).data.status == "open"
+          && request.resource.data.keys().hasAll([
+            "taskId", "submitterUid", "submitterName", "teamRole", "text",
+            "link", "links", "xpAwarded", "status", "submittedAt"
+          ])
+          && request.resource.data.keys().hasOnly([
+            "taskId", "submitterUid", "submitterName", "teamRole", "text",
+            "link", "links", "xpAwarded", "status", "submittedAt", "gameResult"
+          ])
+          && validGameResult(request.resource.data)
+          && request.resource.data.taskId == taskId
+          && request.resource.data.submitterUid == request.auth.uid
+          && request.resource.data.teamRole == get(/databases/$(database)/documents/tasks/$(taskId)).data.targetRole
+          && request.resource.data.submitterName is string
+          && request.resource.data.submitterName.size() >= 1
+          && request.resource.data.submitterName.size() <= 120
+          && request.resource.data.text is string
+          && request.resource.data.text.size() >= 3
+          && request.resource.data.text.size() <= 3000
+          && request.resource.data.link is string
+          && request.resource.data.link.size() <= 1000
+          && (request.resource.data.link == "" || request.resource.data.link.matches("^https?://.+"))
+          && validLinkEntries(request.resource.data)
+           && request.resource.data.xpAwarded == 0
+           && request.resource.data.status == "pending";
+        allow update, delete: if roleIs("admin");
+      }
+    }
+
+    match /memberRatings/{uid} {
+      allow read: if signedIn()
+        && (request.auth.uid == uid
+          || roleIs("admin")
+          || (roleIs("leaders")
+            && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true
+            && get(/databases/$(database)/documents/teamMembers/$(uid)).data.role != "admin"
+            && validUniversityTag(get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("universityTag", ""))
+            && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("universityTag", "") != ""
+            && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("universityTag", "")
+              == get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get("leadingUniversityTag", ""))
+          || (exists(/databases/$(database)/documents/teamMembers/$(uid))
+            && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true
+            && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "") != "admin"
+            && leadsTeamRole(get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", ""))));
+      allow create, update: if canManageTeamMember(uid)
+        && request.resource.data.keys().hasAll(["scores", "notes", "universityTag", "active", "updatedByUid", "updatedAt"])
+        && request.resource.data.keys().hasOnly(["scores", "notes", "universityTag", "active", "updatedByUid", "updatedAt"])
+        && validRatingScores(request.resource.data.scores)
+        && validRatingNotes(request.resource.data.notes)
+        && request.resource.data.universityTag
+          == getAfter(/databases/$(database)/documents/teamMembers/$(uid)).data.get("universityTag", "")
+        && request.resource.data.active == getAfter(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false)
+        && request.resource.data.updatedByUid == request.auth.uid
+        && request.resource.data.updatedAt == request.time;
+      allow delete: if false;
+    }
+
+    match /teamMembers/{uid} {
+      // Only public profile fields should be stored here. Do not put passwords,
+      // private contact details, or other sensitive data in this document.
+      allow read: if (signedIn() && request.auth.uid == uid)
+        || resource.data.active == true
+        || roleIs("admin");
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasAll([
+          "uid", "displayName", "photoURL", "bio", "socialLinks", "role", "active",
+          "dashboardRoles", "universityTag", "leadingUniversityTag", "xp", "level",
+          "answersCount", "tasksCompleted", "createdAt", "updatedAt"
+        ])
+        && request.resource.data.keys().hasOnly([
+          "uid", "displayName", "photoURL", "bio", "socialLinks", "role", "active",
+          "dashboardRoles", "universityTag", "leadingUniversityTag", "xp", "level",
+          "answersCount", "tasksCompleted", "createdAt", "updatedAt"
+        ])
+        && request.resource.data.uid == uid
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() >= 1
+        && request.resource.data.displayName.size() <= 80
+        && request.resource.data.photoURL == ""
+        && request.resource.data.bio == ""
+        && validSocialLinks(request.resource.data.socialLinks)
+        && request.resource.data.role == "user"
+        && request.resource.data.active == true
+        && request.resource.data.dashboardRoles is list
+        && request.resource.data.dashboardRoles.size() == 1
+        && request.resource.data.dashboardRoles.hasOnly(["user"])
+        && request.resource.data.universityTag == ""
+        && request.resource.data.leadingUniversityTag == ""
+        && request.resource.data.xp == 0
+        && request.resource.data.level == 1
+        && request.resource.data.answersCount == 0
+        && request.resource.data.tasksCompleted == 0
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time;
+      allow update: if (
+          roleIs("admin")
+          && (request.resource.data.role == resource.data.role
+            || (uid != request.auth.uid
+              && resource.data.role != "admin"
+              && request.resource.data.role in ["user", "leaders", "public", "tech", "social", "designers", "content", "event"]))
+          && request.resource.data.active == resource.data.active
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "displayName", "photoURL", "bio", "xp", "level", "answersCount", "updatedAt", "lastTaskId", "lastAnsweredQuestionId", "tasksCompleted", "universityTag", "leadingUniversityTag", "role", "dashboardRoles", "teamLeadRoles", "adminTeamAssignment"
+          ])
+          && (!request.resource.data.keys().hasAny(["dashboardRoles"])
+            || (request.resource.data.dashboardRoles is list
+              && request.resource.data.dashboardRoles.size() <= 8
+              && request.resource.data.dashboardRoles.hasOnly(["user", "leaders", "public", "tech", "social", "designers", "content", "event"])
+              && (request.resource.data.role == "user"
+                || request.resource.data.dashboardRoles.size() == 0)))
+          && (!request.resource.data.keys().hasAny(["teamLeadRoles"])
+            || (request.resource.data.teamLeadRoles is list
+              && request.resource.data.teamLeadRoles.size() <= 8
+              && request.resource.data.teamLeadRoles.hasOnly(["user", "leaders", "public", "tech", "social", "designers", "content", "event"])))
+          && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(["xp"])
+            || (request.resource.data.xp is int
+              && request.resource.data.xp >= 0
+              && request.resource.data.xp <= 100000000
+              && request.resource.data.level is int
+              && request.resource.data.level >= 1))
+          && (!request.resource.data.keys().hasAny(["universityTag"]) || validUniversityTag(request.resource.data.universityTag))
+          && (!request.resource.data.keys().hasAny(["leadingUniversityTag"]) || validUniversityTag(request.resource.data.leadingUniversityTag))
+          && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(["adminTeamAssignment"])
+            || (resource.data.role == "admin"
+              && request.resource.data.role == "admin"
+              && validAdminTeamAssignment(request.resource.data.adminTeamAssignment)))
+        ) || (
+          member()
+          && request.auth.uid == uid
+          && resource.data.role != "admin"
+          && request.resource.data.role == resource.data.role
+          && request.resource.data.active == resource.data.active
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "displayName", "photoURL", "xp", "level", "answersCount", "lastAnsweredQuestionId", "updatedAt"
+          ])
+          && request.resource.data.xp is int
+          && request.resource.data.xp == resource.data.get("xp", 0) + 50
+          && request.resource.data.level is int
+          && request.resource.data.level >= 1
+          && request.resource.data.answersCount is int
+          && request.resource.data.answersCount == resource.data.get("answersCount", 0) + 1
+          && request.resource.data.lastAnsweredQuestionId is string
+          && request.resource.data.lastAnsweredQuestionId != resource.data.get("lastAnsweredQuestionId", "")
+          && get(/databases/$(database)/documents/questions/$(request.resource.data.lastAnsweredQuestionId)).data.status == "open"
+          && get(/databases/$(database)/documents/questions/$(request.resource.data.lastAnsweredQuestionId)).data.targetRole == resource.data.role
+          && getAfter(/databases/$(database)/documents/questions/$(request.resource.data.lastAnsweredQuestionId)).data.status == "answered"
+          && getAfter(/databases/$(database)/documents/questions/$(request.resource.data.lastAnsweredQuestionId)).data.answeredByUid == request.auth.uid
+        ) || (
+          canManageTeamMember(uid)
+          && request.auth.uid != uid
+          && resource.data.active == true
+          && resource.data.role != "admin"
+          && request.resource.data.role == resource.data.role
+          && request.resource.data.active == resource.data.active
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "xp", "level", "updatedAt"
+          ])
+          && request.resource.data.xp is int
+           // Leaders may add or subtract XP, with a 100,000-point change cap.
+           && request.resource.data.xp >= 0
+           && request.resource.data.xp >= resource.data.get("xp", 0) - 100000
+           && request.resource.data.xp <= resource.data.get("xp", 0) + 100000
+          && request.resource.data.level is int
+          && request.resource.data.level >= 1
+        ) || (
+          signedIn()
+          && request.auth.uid == uid
+          && request.resource.data.role == resource.data.role
+          && request.resource.data.active == resource.data.active
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "displayName", "photoURL", "bio", "socialLinks", "updatedAt"
+          ])
+          && validSocialLinks(request.resource.data.get("socialLinks", {}))
+          // Some older member records predate XP/stats; default missing fields
+          // to their original zero values so profile edits do not get denied.
+          && request.resource.data.get("xp", 0) == resource.data.get("xp", 0)
+          && request.resource.data.get("level", 1) == resource.data.get("level", 1)
+          && request.resource.data.get("answersCount", 0) == resource.data.get("answersCount", 0)
+          && request.resource.data.get("displayName", "") is string
+          && request.resource.data.get("displayName", "").size() >= 2
+          && request.resource.data.get("displayName", "").size() <= 80
+          && request.resource.data.get("photoURL", "") is string
+          && request.resource.data.get("photoURL", "").size() <= 1000
+          && request.resource.data.get("bio", "") is string
+          && request.resource.data.get("bio", "").size() <= 240
+        );
+      allow create, delete: if false;
+
+      match /notificationTokens/{tokenId} {
+        allow read, delete: if signedIn() && request.auth.uid == uid;
+        allow create, update: if signedIn()
+          && request.auth.uid == uid
+          && request.resource.data.uid == uid
+          && request.resource.data.token is string
+          && request.resource.data.token.size() >= 20
+          && request.resource.data.token.size() <= 500;
+      }
+
+      match /calendarEvents/{eventId} {
+        function calendarOwner() { return member() && request.auth.uid == uid; }
+        function validPersonalEvent() {
+          return request.resource.data.keys().hasAll(["title", "notes", "startsAt", "endsAt", "status", "createdAt", "updatedAt"])
+            && request.resource.data.keys().hasOnly(["title", "notes", "startsAt", "endsAt", "status", "createdAt", "updatedAt"])
+            && request.resource.data.title is string
+            && request.resource.data.title.size() >= 1
+            && request.resource.data.title.size() <= 120
+            && request.resource.data.notes is string
+            && request.resource.data.notes.size() <= 2000
+            && request.resource.data.startsAt is timestamp
+            && request.resource.data.endsAt is timestamp
+            && request.resource.data.endsAt > request.resource.data.startsAt
+            && request.resource.data.status in ["auto", "coming", "done", "missed"]
+            && request.resource.data.updatedAt == request.time;
+        }
+        allow read, delete: if calendarOwner();
+        allow create: if calendarOwner() && validPersonalEvent() && request.resource.data.createdAt == request.time;
+        allow update: if calendarOwner() && validPersonalEvent()
+          && request.resource.data.createdAt == resource.data.createdAt;
+      }
+
+      match /calendarOverrides/{sessionId} {
+        allow read, delete: if member() && request.auth.uid == uid;
+        allow create, update: if member() && request.auth.uid == uid
+          && request.resource.data.keys().hasAll(["hidden", "status", "updatedAt"])
+          && request.resource.data.keys().hasOnly(["hidden", "status", "updatedAt"])
+          && request.resource.data.hidden is bool
+          && request.resource.data.status in ["auto", "coming", "done", "missed"]
+          && request.resource.data.updatedAt == request.time;
+      }
+
+      match /notifications/{notificationId} {
+        allow read: if signedIn() && request.auth.uid == uid;
+        allow delete: if signedIn() && request.auth.uid == uid;
+        allow update: if signedIn()
+          && request.auth.uid == uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["read"])
+          && request.resource.data.read == true;
+        allow create: if (signedIn() || request.resource.data.type == "form_response")
+          && request.resource.data.keys().hasAll([
+            "type", "title", "message", "actorUid", "actorName", "createdAt", "read"
+          ])
+          && request.resource.data.keys().hasOnly([
+            "type", "title", "message", "actorUid", "actorName", "createdAt",
+             "read", "questionId", "taskId", "reviewStatus", "formId", "technicalMaterialId",
+             "courseId", "sessionId", "accessScopeType", "accessScopeTarget", "technicalAccessGrantId", "responseId",
+             "chatId", "chatMessageId"
+          ])
+          && request.resource.data.type is string
+          && request.resource.data.title is string
+          && request.resource.data.title.size() >= 1
+          && request.resource.data.title.size() <= 120
+          && request.resource.data.message is string
+          && request.resource.data.message.size() >= 1
+          && request.resource.data.message.size() <= 1500
+          && request.resource.data.actorUid == (request.resource.data.type == "form_response" ? "" : (signedIn() ? request.auth.uid : ""))
+          && request.resource.data.actorName is string
+          && request.resource.data.actorName.size() >= 1
+          && request.resource.data.actorName.size() <= 120
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.read == false
+          && (
+            (request.resource.data.type == "question_answer"
+              && request.resource.data.questionId is string
+              && getAfter(/databases/$(database)/documents/questions/$(request.resource.data.questionId)).data.status == "answered"
+              && getAfter(/databases/$(database)/documents/questions/$(request.resource.data.questionId)).data.ownerUid == uid
+              && getAfter(/databases/$(database)/documents/questions/$(request.resource.data.questionId)).data.answeredByUid == request.auth.uid)
+            || (request.resource.data.type == "question_received"
+              && signedIn()
+              && request.resource.data.questionId is string
+              && notificationId == "question_" + request.resource.data.questionId
+              && get(/databases/$(database)/documents/questions/$(request.resource.data.questionId)).data.get("ownerUid", "") == request.auth.uid
+              && get(/databases/$(database)/documents/questions/$(request.resource.data.questionId)).data.get("status", "") == "open"
+              && taskAudienceMatchesMember(get(/databases/$(database)/documents/questions/$(request.resource.data.questionId)).data, uid))
+            || (request.resource.data.type == "form_response"
+              && request.resource.data.actorName == "Form respondent"
+              && request.resource.data.formId is string
+              && request.resource.data.responseId is string
+              && notificationId == "form-response_" + request.resource.data.formId + "_" + request.resource.data.responseId
+              && get(/databases/$(database)/documents/forms/$(request.resource.data.formId)).data.get("createdBy", "") == uid
+              && get(/databases/$(database)/documents/forms/$(request.resource.data.formId)).data.get("published", false) == true
+              && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true
+              && !exists(/databases/$(database)/documents/forms/$(request.resource.data.formId)/responses/$(request.resource.data.responseId))
+              && getAfter(/databases/$(database)/documents/forms/$(request.resource.data.formId)/responses/$(request.resource.data.responseId)).data.submittedAt == request.time)
+            || (request.resource.data.type == "chat_message"
+              && member()
+              && request.resource.data.chatId is string
+              && request.resource.data.chatMessageId is string
+              && notificationId == "chat_" + request.resource.data.chatId + "_" + request.resource.data.chatMessageId
+              && chatParticipant(get(/databases/$(database)/documents/leaderChats/$(request.resource.data.chatId)).data)
+              && uid != request.auth.uid
+              && (get(/databases/$(database)/documents/leaderChats/$(request.resource.data.chatId)).data.memberUid == uid
+                || get(/databases/$(database)/documents/leaderChats/$(request.resource.data.chatId)).data.leaderUid == uid)
+              && !exists(/databases/$(database)/documents/leaderChats/$(request.resource.data.chatId)/messages/$(request.resource.data.chatMessageId))
+              && getAfter(/databases/$(database)/documents/leaderChats/$(request.resource.data.chatId)/messages/$(request.resource.data.chatMessageId)).data.senderUid == request.auth.uid
+              && getAfter(/databases/$(database)/documents/leaderChats/$(request.resource.data.chatId)/messages/$(request.resource.data.chatMessageId)).data.createdAt == request.time)
+            || (request.resource.data.type == "attendance_update"
+              && roleIs("admin")
+              && request.resource.data.sessionId is string
+              && getAfter(/databases/$(database)/documents/nawrasOnlineSessions/$(request.resource.data.sessionId)/attendance/$(uid)).data.updatedBy == request.auth.uid
+              && getAfter(/databases/$(database)/documents/nawrasOnlineSessions/$(request.resource.data.sessionId)/attendance/$(uid)).data.updatedAt == request.time)
+            || (request.resource.data.type == "task_review"
+              && roleIs("admin")
+              && request.resource.data.taskId is string
+              && request.resource.data.reviewStatus in ["approved", "rejected"]
+              && getAfter(/databases/$(database)/documents/tasks/$(request.resource.data.taskId)/submissions/$(uid)).data.status == request.resource.data.reviewStatus
+              && getAfter(/databases/$(database)/documents/tasks/$(request.resource.data.taskId)/submissions/$(uid)).data.reviewedByUid == request.auth.uid)
+            || (request.resource.data.type == "xp_adjustment"
+              && canManageTeamMember(uid)
+              && request.resource.data.message.matches(".*Reason: .{3,}")
+              && getAfter(/databases/$(database)/documents/teamMembers/$(uid)).data.diff(
+                get(/databases/$(database)/documents/teamMembers/$(uid)).data
+              ).affectedKeys().hasAny(["xp"]))
+            || (request.resource.data.type == "xp_reset"
+              && roleIs("admin")
+              && getAfter(/databases/$(database)/documents/teamMembers/$(uid)).data.xp == 0
+              && getAfter(/databases/$(database)/documents/teamMembers/$(uid)).data.diff(
+                get(/databases/$(database)/documents/teamMembers/$(uid)).data
+              ).affectedKeys().hasAny(["xp", "level"]))
+            || (request.resource.data.type == "ratings_update"
+              && canManageTeamMember(uid)
+              && getAfter(/databases/$(database)/documents/memberRatings/$(uid)).data.updatedByUid == request.auth.uid
+              && (!exists(/databases/$(database)/documents/memberRatings/$(uid))
+                || getAfter(/databases/$(database)/documents/memberRatings/$(uid)).data.diff(
+                  get(/databases/$(database)/documents/memberRatings/$(uid)).data
+                ).affectedKeys().hasAny(["scores", "notes"])))
+            || (request.resource.data.type == "ratings_reset"
+              && roleIs("admin")
+              && getAfter(/databases/$(database)/documents/memberRatings/$(uid)).data.scores.size() == 0
+              && getAfter(/databases/$(database)/documents/memberRatings/$(uid)).data.notes.size() == 0)
+            || (request.resource.data.type == "member_assignment"
+              && roleIs("admin")
+              && getAfter(/databases/$(database)/documents/teamMembers/$(uid)).data.diff(
+                get(/databases/$(database)/documents/teamMembers/$(uid)).data
+              ).affectedKeys().hasAny([
+                "role", "dashboardRoles", "universityTag", "leadingUniversityTag",
+                "teamLeadRoles", "adminTeamAssignment"
+              ]))
+             || (request.resource.data.type == "dashboard_access"
+               && roleIs("admin")
+               && request.resource.data.accessScopeType in ["user", "role", "university"]
+               && request.resource.data.accessScopeTarget is string
+               && request.resource.data.accessScopeTarget.size() >= 1
+               && request.resource.data.accessScopeTarget.size() <= 120
+               && (request.resource.data.accessScopeType != "university"
+                 || validUniversityTag(request.resource.data.accessScopeTarget))
+               && dashboardAccessNotificationMatchesMember(uid))
+             || (request.resource.data.type == "course_update"
+               && roleIs("admin")
+               && request.resource.data.courseId is string
+               && exists(/databases/$(database)/documents/courses/$(request.resource.data.courseId))
+               && exists(/databases/$(database)/documents/teamMembers/$(uid))
+               && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true)
+             || (request.resource.data.type == "task_available"
+               && roleIs("admin")
+               && request.resource.data.taskId is string
+               && exists(/databases/$(database)/documents/tasks/$(request.resource.data.taskId))
+               && taskAudienceMatchesMember(
+                 get(/databases/$(database)/documents/tasks/$(request.resource.data.taskId)).data,
+                 uid
+               ))
+             || (request.resource.data.type == "task_submitted"
+               && member()
+               && request.resource.data.taskId is string
+               && notificationId == "task-submitted_" + request.resource.data.taskId + "_" + request.auth.uid
+               && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true
+               && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "") == "admin"
+               && get(/databases/$(database)/documents/tasks/$(request.resource.data.taskId)/submissions/$(request.auth.uid)).data.get("submitterUid", "") == request.auth.uid
+               && get(/databases/$(database)/documents/tasks/$(request.resource.data.taskId)/submissions/$(request.auth.uid)).data.get("status", "") == "pending")
+             || ((request.resource.data.type == "session_available"
+                 || request.resource.data.type == "session_cancelled")
+               && sessionManager()
+               && request.resource.data.sessionId is string
+               && exists(/databases/$(database)/documents/nawrasOnlineSessions/$(request.resource.data.sessionId))
+               && ((request.resource.data.type == "session_available"
+                   && get(/databases/$(database)/documents/nawrasOnlineSessions/$(request.resource.data.sessionId)).data.get("status", "") == "scheduled")
+                 || (request.resource.data.type == "session_cancelled"
+                   && get(/databases/$(database)/documents/nawrasOnlineSessions/$(request.resource.data.sessionId)).data.get("status", "") == "cancelled"))
+               && sessionAudienceMatchesMember(
+                 get(/databases/$(database)/documents/nawrasOnlineSessions/$(request.resource.data.sessionId)).data,
+                 uid
+               ))
+             || (request.resource.data.type == "form_available"
+               && formManager()
+               && request.resource.data.formId is string
+               && exists(/databases/$(database)/documents/forms/$(request.resource.data.formId))
+               && get(/databases/$(database)/documents/forms/$(request.resource.data.formId)).data.published == true
+               && formAudienceMatchesUser(
+                 get(/databases/$(database)/documents/forms/$(request.resource.data.formId)).data,
+                 uid
+               ))
+             || (request.resource.data.type == "technical_material"
+                && (roleIs("admin") || hasDashboardAccess("technicalMaterialsManage"))
+               && request.resource.data.technicalMaterialId is string
+               && exists(/databases/$(database)/documents/technicalMaterials/$(request.resource.data.technicalMaterialId))
+               && get(/databases/$(database)/documents/technicalMaterials/$(request.resource.data.technicalMaterialId)).data.createdByUid == request.auth.uid
+               && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true
+                && (get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "") == "tech"
+                  || (request.resource.data.technicalAccessGrantId is string
+                    && technicalAccessGrantMatchesMember(request.resource.data.technicalAccessGrantId, uid))))
+          );
+        allow delete: if false;
+      }
+    }
+
+    match /leaderChats/{chatId} {
+      allow read: if chatParticipant(resource.data);
+      allow create: if member()
+        && request.resource.data.keys().hasAll([
+          "memberUid", "memberName", "leaderUid", "leaderName", "universityTag",
+          "universityName", "lastMessagePreview", "lastSenderUid", "lastMessageAt",
+          "updatedAt"
+        ])
+        && request.resource.data.keys().hasOnly([
+          "memberUid", "memberName", "leaderUid", "leaderName", "universityTag",
+          "universityName", "lastMessagePreview", "lastSenderUid", "lastMessageAt",
+          "updatedAt"
+        ])
+        && request.resource.data.memberUid == request.auth.uid
+        && request.resource.data.memberName is string
+        && request.resource.data.leaderName is string
+        && request.resource.data.universityTag is string
+        && validUniversityTag(request.resource.data.universityTag)
+        && request.resource.data.universityTag != ""
+        && request.resource.data.lastSenderUid == request.auth.uid
+        && request.resource.data.lastMessagePreview is string
+        && request.resource.data.lastMessagePreview.size() >= 1
+        && request.resource.data.lastMessagePreview.size() <= 160
+        && validChatParticipant(request.resource.data);
+      allow update: if chatParticipant(resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "lastMessagePreview", "lastSenderUid", "lastMessageAt", "updatedAt"
+        ])
+        && request.resource.data.lastSenderUid == request.auth.uid
+        && request.resource.data.lastMessagePreview is string
+        && request.resource.data.lastMessagePreview.size() >= 1
+        && request.resource.data.lastMessagePreview.size() <= 160
+        && validChatParticipant(request.resource.data);
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        allow read: if chatParticipant(get(/databases/$(database)/documents/leaderChats/$(chatId)).data);
+        allow create: if chatParticipant(get(/databases/$(database)/documents/leaderChats/$(chatId)).data)
+          && request.resource.data.keys().hasAll(["text", "senderUid", "senderName", "createdAt"])
+          && request.resource.data.keys().hasOnly(["text", "senderUid", "senderName", "createdAt"])
+          && request.resource.data.senderUid == request.auth.uid
+          && request.resource.data.senderName is string
+          && request.resource.data.senderName.size() >= 1
+          && request.resource.data.senderName.size() <= 120
+          && request.resource.data.text is string
+          && request.resource.data.text.size() >= 1
+          && request.resource.data.text.size() <= 2000;
+        allow update, delete: if false;
+      }
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

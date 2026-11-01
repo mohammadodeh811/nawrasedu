@@ -1,0 +1,177 @@
+.task-extra-fieldset {
+  border: 1px solid rgba(127, 127, 127, 0.28);
+  border-radius: 14px;
+  padding: 14px 16px 16px;
+  margin: 4px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.task-extra-fieldset legend {
+  font-weight: 700;
+  padding: 0 6px;
+}
+
+.task-extra-fieldset code {
+  font-size: 0.85em;
+  padding: 1px 5px;
+  border-radius: 6px;
+  background: rgba(127, 127, 127, 0.15);
+  word-break: break-word;
+}
+
+#taskGameHtml {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+}
+
+.task-assets,
+.task-game-result {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.task-assets-label {
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+
+.task-assets-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.task-asset-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(127, 127, 127, 0.3);
+  color: inherit;
+  text-decoration: none;
+  font-size: 0.9rem;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.task-asset-chip:hover,
+.task-asset-chip:focus-visible {
+  border-color: currentColor;
+  background: rgba(127, 127, 127, 0.1);
+}
+
+.task-asset-icon {
+  font-size: 0.7rem;
+  font-weight: 800;
+  min-width: 1.6em;
+  text-align: center;
+  opacity: 0.8;
+}
+
+.task-game-launch {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 14px 16px;
+  border-radius: 14px;
+  border: 1px dashed rgba(127, 127, 127, 0.4);
+  margin-top: 12px;
+}
+
+.task-game-launch p {
+  margin: 4px 0 0;
+  opacity: 0.8;
+}
+
+.task-game-submit-form {
+  margin-top: 12px;
+}
+
+.task-game-result {
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(127, 127, 127, 0.1);
+}
+
+.task-game-result p,
+.task-game-result small {
+  margin: 0;
+}
+
+.task-game-score {
+  font-size: 1.1rem;
+}
+
+.task-game-result pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.8rem;
+  max-height: 220px;
+  overflow: auto;
+  margin: 8px 0 0;
+}
+
+.modal-card.task-game-card {
+  width: min(1000px, 96vw);
+  max-width: 96vw;
+  max-height: 94vh;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.task-game-status {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(127, 127, 127, 0.12);
+}
+
+.task-game-status.is-success {
+  background: rgba(34, 197, 94, 0.16);
+}
+
+.task-game-status.is-error {
+  background: rgba(239, 68, 68, 0.16);
+}
+
+.task-game-frame-wrap {
+  flex: 1;
+  min-height: 0;
+}
+
+.task-game-frame {
+  width: 100%;
+  height: min(70vh, 640px);
+  border: 1px solid rgba(127, 127, 127, 0.3);
+  border-radius: 12px;
+  background: #fff;
+  display: block;
+}
+
+.task-game-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.task-game-actions .task-game-submit {
+  margin-inline-end: auto;
+  font-weight: 700;
+}
+
+.task-game-actions .task-game-submit:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}

@@ -1,0 +1,23 @@
+NAWRAS EDU forms and dashboard update
+
+Updated files:
+- forms.html: added an accessible completion panel for successful form submissions.
+- admin.html: added the role-aware dashboard navigation rail.
+- app.js: adds unique per-form share links, direct form links via ?form=<id>, a live completion progress bar, the celebratory submission state, and dashboard section switching.
+- styles.css: adds form and completion animations, improves response-table printing, and styles the responsive dashboard navigation and focused section layout.
+- games.html: adds a Games & Events page with the Minecraft community server card, server details modal, download link, and tutorial-video placeholder.
+- Public navigation: adds Games & Events to the site-wide navigation and home directory.
+- Admins can assign university tags to members and assign each leader the university they lead.
+- Leaders see the XP leaderboard for members from their assigned university only.
+- Leaders can grant XP to active members in their assigned university.
+- Members can use private daily chat with their assigned leader; leaders receive an inbox for their assigned university.
+- Added `functions/cleanupLeaderChats` and updated `firestore.rules` for protected chat access.
+- Fixed member-to-leader chat sending: authenticated member records now retain their UID, and the send flow reloads the assigned leader conversation before showing an error.
+- Added real-time Firestore listeners so leaders see new conversations and incoming messages without refreshing the dashboard.
+
+Deployment:
+- Upload the normal web files (`admin.html`, `app.js`, `styles.css`, and `firestore.rules`).
+- Deploy the scheduled function from `functions/` with `firebase deploy --only functions:cleanupLeaderChats,firestore:rules`.
+- Existing `teamMembers` records can be updated from the Admin dashboard; set each member's university and each leader's “Leads university” field.
+
+The ZIP contains these updated files plus the other supplied project files, renamed to the filenames referenced by the site.

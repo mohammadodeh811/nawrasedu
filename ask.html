@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#f7f4ef"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="NAWRAS EDU">
+  <link rel="manifest" href="manifest.json">
+  <meta name="description" content="Ask the NAWRAS EDU team and learn from public answers."><title>Ask Nawras | NAWRAS EDU</title>
+  <link rel="icon" type="image/png" href="https://nawrasedu.site.je/icoom.png"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap" rel="stylesheet"><link rel="stylesheet" href="styles.css">
+  <script src="https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js" defer></script>
+  <script>
+    window.OneSignalDeferred = window.OneSignalDeferred || [];
+    OneSignalDeferred.push(async function(OneSignal) {
+      await OneSignal.init({
+        appId: "524ac1d6-c661-4460-9b72-a91281e60623",
+        serviceWorkerPath: "firebase-messaging-sw.js",
+        serviceWorkerParam: { scope: "/" }
+      });
+    });
+  </script>
+</head>
+<body data-page="ask">
+  <div id="toastRoot" class="toast-root" aria-live="polite"></div>
+  <header class="site-header"><div class="container nav-wrap"><a href="index.html" class="brand" aria-label="NAWRAS EDU home"><img src="https://nawrasedu.site.je/icoom.png" alt="NAWRAS EDU logo" class="brand-logo"><span class="brand-copy"><strong>NAWRAS</strong><small>EDU</small></span></a><button class="menu-toggle" id="menuToggle" aria-expanded="false" aria-controls="primaryNav" aria-label="Open navigation">☰</button><nav id="primaryNav" class="primary-nav"><a href="index.html">Home</a><a href="courses.html">Courses</a><a href="games.html">Games &amp; Events</a><a href="forms.html">Forms</a><a href="schedule.html">Schedule</a><a href="miro.html">Miro board</a><a class="active" href="ask.html">Ask Nawras</a><a class="btn btn-primary btn-small" href="admin.html">Team login</a></nav></div></header>
+  <main>
+    <section class="page-hero"><div class="container page-hero-content"><span class="eyebrow">Learn together</span><h1>Ask <span>Nawras.</span></h1><p>Choose the team role closest to your question. When a team member answers, the answer becomes part of the public knowledge library.</p></div></section>
+    <section class="section content-section"><div class="container ask-layout">
+      <section class="panel ask-form-panel"><div class="panel-heading"><div><span class="panel-kicker">Send a question</span><h2>Who should answer?</h2></div></div><form id="askQuestionForm" class="form-stack"><label>Team role<select id="askTargetRole" required><option value="">Choose a team role</option><option value="leaders">Leaders</option><option value="public">Public</option><option value="tech">Technical</option><option value="social">Social</option><option value="designers">Designers</option><option value="content">Content</option><option value="event">Event</option></select></label><label>Your question<textarea id="askQuestion" rows="7" maxlength="1000" placeholder="Write a clear question the NAWRAS team can answer for everyone..." required></textarea><small id="askQuestionCount">0 / 1000</small></label><button class="btn btn-primary btn-block" type="submit">Send question <span>→</span></button><p class="ask-form-note">Questions are public after they are answered. Please do not include passwords, private contact details, or sensitive information.</p></form></section>
+       <section class="ask-library"><div class="section-heading"><div><span class="eyebrow">Community knowledge</span><h2>Answered questions</h2></div><span id="publicQuestionCount" class="count-pill">0</span></div><div id="publicQuestionsList" class="question-list"><div class="empty-state">Loading answered questions…</div></div></section>
+       <section id="askerInboxPanel" class="panel inbox-panel asker-inbox-panel hidden"><div class="panel-heading"><div><span class="panel-kicker">Private to this browser</span><h2>Your question inbox</h2></div><span id="askerInboxCount" class="count-pill">0 messages</span></div><p class="panel-hint">Answer notifications are saved to this browser. Open Ask Nawras in the same browser to see them later.</p><div id="askerInboxList" class="inbox-list"><div class="empty-state">Your question updates will appear here.</div></div></section>
+    </div></section>
+  </main>
+  <div id="questionSentModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="questionSentTitle"><div class="modal-backdrop" data-close-modal="questionSentModal"></div><div class="modal-card question-success-modal"><div class="success-mark">✓</div><span class="eyebrow">Question saved</span><h2 id="questionSentTitle">Your question is on its way.</h2><p>The selected team can now answer it. You’ll see a private update in “Your question inbox” on this page when it is answered; the answer also joins the public library.</p><button class="btn btn-primary btn-block" type="button" data-close-modal="questionSentModal">Got it</button></div></div>
+  <footer class="site-footer"><div class="container footer-wrap"><div class="footer-info"><strong>NAWRAS EDU</strong><span>Learn • Build • Grow</span></div><span class="footer-copy">© <span id="year"></span> NAWRAS EDU</span></div></footer>
+  <script type="module" src="app.js"></script>
+</body></html>

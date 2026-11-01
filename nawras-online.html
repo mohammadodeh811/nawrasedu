@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8">
+  <script>
+    (function () {
+      var host = window.location.hostname.toLowerCase();
+      if (host === "nawrasedu.site" || host === "www.nawrasedu.site") {
+        window.location.replace("https://nawrasedu.site.je" + window.location.pathname + window.location.search + window.location.hash);
+      }
+    })();
+  </script>
+  <link rel="canonical" href="https://nawrasedu.site.je/nawras-online.html">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f3f8fa">
+  <meta name="description" content="Private NAWRAS EDU video sessions for active team members.">
+  <meta property="og:title" content="NawrasOnline | NAWRAS EDU">
+  <meta property="og:description" content="Private NAWRAS EDU video sessions for active team members.">
+  <meta property="og:type" content="website">
+  <meta name="twitter:card" content="summary_large_image">
+  <title>NawrasOnline | NAWRAS EDU</title>
+  <link rel="icon" type="image/png" href="https://nawrasedu.site.je/icoom.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body data-page="nawras-online">
+  <div id="toastRoot" class="toast-root" aria-live="polite"></div>
+  <header class="site-header">
+    <div class="container nav-wrap">
+      <a href="index.html" class="brand" aria-label="NAWRAS EDU home">
+        <img src="https://nawrasedu.site.je/icoom.png" alt="" class="brand-logo">
+        <span class="brand-copy"><strong>NAWRAS</strong><small>EDU</small></span>
+      </a>
+      <button class="menu-toggle" id="menuToggle" aria-expanded="false" aria-controls="primaryNav" aria-label="Open navigation">☰</button>
+      <nav id="primaryNav" class="primary-nav" aria-label="Main navigation">
+        <a href="index.html">Home</a>
+        <a href="courses.html">Courses</a>
+        <a href="admin.html?view=calendar">My calendar</a>
+        <a class="active" href="nawras-online.html">NawrasOnline</a>
+        <a href="admin.html">Team dashboard</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="online-page">
+    <section class="online-hero">
+      <div class="container online-hero-inner">
+        <div class="online-hero-copy">
+          <span class="eyebrow">NAWRAS EDU <span aria-hidden="true">/</span> PRIVATE TEAM ROOMS</span>
+          <h1>Meet together,<br><span>move forward.</span></h1>
+          <p>Bring your team into one focused space for live video, screen sharing, chat, and questions.</p>
+          <div class="online-hero-actions">
+            <a id="onlineHeroCta" class="btn btn-primary online-hero-cta" href="#onlineLoginForm">Sign in to see sessions <span class="material-symbols-outlined" aria-hidden="true">arrow_forward</span></a>
+            <span class="online-hero-support">For active NAWRAS EDU team members</span>
+          </div>
+          <div class="online-privacy-note">
+            <span class="material-symbols-outlined" aria-hidden="true">lock</span>
+            <span>Private rooms for your team and university</span>
+          </div>
+        </div>
+        <div class="online-hero-visual" aria-hidden="true">
+          <div class="online-visual-orbit"></div>
+          <div class="online-preview-window">
+            <div class="online-preview-top">
+              <span class="online-preview-brand"><span></span> NAWRAS EDU</span>
+              <span class="online-preview-live"><i></i> SESSION LIVE</span>
+            </div>
+            <div class="online-preview-title">Design team <span>Weekly sync</span></div>
+            <div class="online-preview-people">
+              <div class="online-preview-person preview-person-one"><span class="online-preview-avatar">D</span><span class="online-preview-name">Dana</span></div>
+              <div class="online-preview-person preview-person-two"><span class="online-preview-avatar">S</span><span class="online-preview-name">Sami</span></div>
+              <div class="online-preview-person preview-person-three"><span class="online-preview-avatar">R</span><span class="online-preview-name">Rana</span></div>
+              <div class="online-preview-person preview-person-four"><span class="online-preview-avatar">+</span><span class="online-preview-name">3 more</span></div>
+            </div>
+            <div class="online-preview-bottom">
+              <span class="online-preview-attendees"><i></i><i></i><i></i><b>+3</b> 6 together</span>
+              <span class="online-preview-controls"><i></i><i></i><i></i><b></b></span>
+            </div>
+          </div>
+          <div class="online-visual-note"><span class="online-visual-note-icon material-symbols-outlined" aria-hidden="true">auto_awesome</span><span><strong>One room.</strong><small>Everyone on the same page.</small></span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section online-content">
+      <div class="container">
+        <div class="online-feature-strip" aria-label="Room features">
+          <article><span class="online-feature-icon"><span class="material-symbols-outlined" aria-hidden="true">videocam</span></span><span><strong>Face-to-face</strong><small>Live video and audio</small></span></article>
+          <article><span class="online-feature-icon is-violet"><span class="material-symbols-outlined" aria-hidden="true">screen_share</span></span><span><strong>Work together</strong><small>Share your screen</small></span></article>
+          <article><span class="online-feature-icon is-green"><span class="material-symbols-outlined" aria-hidden="true">forum</span></span><span><strong>Stay in the flow</strong><small>Room chat and hand raising</small></span></article>
+        </div>
+
+        <section id="onlineLoginPanel" class="online-access-card" aria-labelledby="onlineLoginTitle">
+          <div class="online-access-icon material-symbols-outlined" aria-hidden="true">lock</div>
+          <div>
+            <span class="eyebrow">Member sign in</span>
+            <h2 id="onlineLoginTitle">Sign in to see your sessions</h2>
+            <p id="onlineAuthMessage">Use the same email and password as your NAWRAS EDU team account.</p>
+          </div>
+          <form id="onlineLoginForm" class="online-login-form">
+            <label>Email<input id="onlineEmail" type="email" autocomplete="username" required></label>
+            <label>Password<input id="onlinePassword" type="password" autocomplete="current-password" required></label>
+            <button class="btn btn-primary" type="submit">Sign in</button>
+          </form>
+          <button id="onlineInvalidSignOut" class="text-button hidden" type="button">Sign out of this account</button>
+        </section>
+
+        <section id="onlineMemberPanel" class="hidden" aria-live="polite">
+          <div class="online-member-bar">
+            <div><span class="eyebrow">Signed in</span><strong id="onlineMemberName"></strong><span id="onlineMemberRole" class="online-role-pill"></span></div>
+            <button id="onlineLogoutButton" class="btn btn-outline btn-small" type="button">Log out</button>
+          </div>
+
+          <section id="onlineHostPanel" class="panel online-host-panel hidden" aria-labelledby="onlineHostTitle">
+            <div class="panel-heading">
+              <div><span class="panel-kicker">Admins and leaders</span><h2 id="onlineHostTitle">Create a video session</h2><p class="panel-hint">Choose a team role and, if needed, limit the room to one university.</p></div>
+            </div>
+            <form id="onlineCreateForm" class="online-create-form">
+              <label>Session name<input name="title" maxlength="100" placeholder="e.g. Designers weekly review" required></label>
+              <label>Details<textarea name="description" maxlength="1000" rows="2" placeholder="What should members prepare?"></textarea></label>
+              <div class="online-form-row">
+                <label>Team audience
+                  <select name="audienceRole" required>
+                    <option value="all">All team members</option>
+                    <option value="targeted">Invited members only</option>
+                    <option value="user">User</option>
+                    <option value="leaders">Leaders</option>
+                    <option value="public">Public</option>
+                    <option value="tech">Technical</option>
+                    <option value="social">Social</option>
+                    <option value="designers">Designers</option>
+                    <option value="content">Content</option>
+                    <option value="event">Event</option>
+                  </select>
+                </label>
+                <label>University access
+                  <select name="audienceUniversityTag" required>
+                    <option value="all">All universities</option>
+                    <option value="AAUP-Jenin">AAUP-Jenin only</option>
+                    <option value="AAUP-Ramallah">AAUP-Ramallah only</option>
+                    <option value="BZU">BZU only</option>
+                    <option value="NNU">NNU only</option>
+                    <option value="PPU">PPU only</option>
+                    <option value="PTUK">PTUK only</option>
+                  </select>
+                </label>
+                <label>Start date and time<input name="startsAt" type="datetime-local" required></label>
+                <label>Duration (minutes)<input name="durationMinutes" type="number" min="15" max="480" step="15" value="60" required></label>
+              </div>
+              <fieldset class="online-target-picker"><legend>Invite specific members <span id="onlineTargetCount">0 invited</span></legend><p class="panel-hint">Invited members are included even if their role or university is different. Choose “Invited members only” above to make an individual-only session.</p><label>Find a member<input id="onlineTargetSearch" type="search" placeholder="Search name, role or university" autocomplete="off"></label><div id="onlineTargetMembers" class="online-target-members"><p class="panel-hint">Loading members…</p></div></fieldset>
+              <button class="btn btn-primary" type="submit">Create session</button>
+            </form>
+          </section>
+
+          <section class="online-sessions-section" aria-labelledby="onlineSessionsTitle">
+            <div class="section-heading online-list-heading">
+              <div><span class="eyebrow">Your team’s rooms</span><h2 id="onlineSessionsTitle">Available sessions</h2></div>
+              <span id="onlineSessionCount" class="count-pill">0</span>
+            </div>
+            <div id="onlineSessionsList" class="online-session-list"><div class="empty-state">Loading sessions…</div></div>
+          </section>
+        </section>
+
+        <section id="onlineRoomPanel" class="online-room-panel hidden" aria-labelledby="onlineRoomTitle">
+          <div class="online-room-topbar">
+            <div><span class="eyebrow">NAWRAS EDU live room</span><h2 id="onlineRoomTitle">Connecting…</h2><p id="onlineRoomStatus" role="status">Getting the room ready.</p></div>
+            <div class="online-room-top-actions">
+              <button id="onlineMiniRoomButton" class="btn btn-light-outline btn-small" type="button" title="Keep a floating mini-room visible while you use another tab"><span class="material-symbols-outlined" aria-hidden="true">picture_in_picture_alt</span><span>Pop out mini room</span></button>
+              <button id="onlineRoomSoundButton" class="btn btn-light-outline btn-small online-room-sound-button" type="button" aria-pressed="true" title="Mute room and reaction sounds"><span class="material-symbols-outlined" aria-hidden="true">volume_up</span><span>Sounds on</span></button>
+              <button id="onlineFullscreenButton" class="btn btn-light-outline btn-small" type="button" aria-label="Enter full screen">Full screen</button>
+              <button id="onlineSidebarToggleButton" class="btn btn-light-outline btn-small online-topbar-icon-button hidden" type="button" aria-label="Show chat" title="Show chat" aria-controls="onlineRoomSidebar" aria-expanded="false">
+                <span class="material-symbols-outlined" aria-hidden="true">chat</span>
+                <span class="sr-only online-topbar-icon-label">Show chat</span>
+              </button>
+              <button id="onlineEndSessionButton" class="btn btn-danger btn-small hidden" type="button">End session</button>
+              <button id="onlineLeaveButton" class="btn btn-light-outline btn-small online-topbar-icon-button" type="button" aria-label="Leave room" title="Leave room">
+                <span class="material-symbols-outlined" aria-hidden="true">logout</span>
+                <span class="sr-only">Leave room</span>
+              </button>
+            </div>
+          </div>
+          <aside id="onlineChatNotification" class="online-chat-notification" aria-label="New chat message" hidden>
+            <button id="onlineChatNotificationOpen" class="online-chat-notification-open" type="button" aria-label="Open message in chat">
+              <span id="onlineChatNotificationAvatar" class="online-chat-avatar" aria-hidden="true"></span>
+              <span class="online-chat-notification-copy"><strong id="onlineChatNotificationSender"></strong><span id="onlineChatNotificationText" dir="auto"></span></span>
+            </button>
+            <button id="onlineChatNotificationClose" class="online-reaction-close" type="button" aria-label="Dismiss message preview" title="Dismiss message preview">×</button>
+          </aside>
+          <div class="online-room-layout">
+            <section class="online-stage" aria-label="Session video">
+              <div class="online-stage-hud">
+                <span class="online-stage-live"><span class="online-stage-live-dot" aria-hidden="true"></span>NAWRAS EDU room</span>
+                <div class="online-stage-meta">
+                  <span id="onlineParticipantCount" class="online-participant-count" role="status" aria-live="polite">0 in session</span>
+                  <button id="onlineShowEveryoneButton" class="online-show-everyone-button hidden" type="button">Show everyone</button>
+                </div>
+              </div>
+              <div id="onlineVideoGrid" class="online-video-grid"></div>
+              <div id="onlineReactionFeed" class="online-reaction-feed" aria-hidden="true"></div>
+              <span id="onlineReactionAnnouncement" class="sr-only" role="status" aria-live="polite"></span>
+              <aside id="onlineParticipantDock" class="online-participant-dock hidden" aria-label="Other members in the room">
+                <div class="online-participant-dock-heading"><strong>Other members</strong><span>Tap a photo to focus</span></div>
+                <div id="onlineParticipantAvatars" class="online-participant-avatars"></div>
+              </aside>
+              <div id="onlineAudioShelf" class="online-audio-shelf" aria-hidden="true"></div>
+              <div class="online-controls" aria-label="Call controls">
+                <button id="onlineReactionToggle" class="online-control online-reaction-toggle" type="button" aria-label="Show reactions" title="Show reactions" aria-expanded="false" aria-controls="onlineReactionPicker" disabled><span aria-hidden="true"><span class="material-symbols-outlined">mood</span></span><span class="online-control-label sr-only">Reactions</span></button>
+                <div id="onlineReactionPicker" class="online-reaction-toolbar" role="group" aria-label="Send a reaction" hidden>
+                  <div class="online-reaction-picker-header"><span class="online-reaction-heading">Reactions</span><button id="onlineReactionClose" class="online-reaction-close" type="button" aria-label="Close reactions" title="Close reactions"><span class="material-symbols-outlined" aria-hidden="true">close</span></button></div>
+                  <button class="online-reaction-button" type="button" data-room-reaction="like" title="Like" aria-label="Send Like reaction" disabled><img src="https://i.ibb.co/pph0XSj/like.png" alt=""><span class="sr-only">Like</span></button>
+                  <button class="online-reaction-button" type="button" data-room-reaction="celebrate" title="Celebrate" aria-label="Send Celebrate reaction" disabled><img src="https://i.ibb.co/v4bykbQq/calebrate.png" alt=""><span class="sr-only">Celebrate</span></button>
+                  <button class="online-reaction-button" type="button" data-room-reaction="angry" title="Angry" aria-label="Send Angry reaction" disabled><img src="https://i.ibb.co/3mBJsNnj/angry.png" alt=""><span class="sr-only">Angry</span></button>
+                  <button class="online-reaction-button" type="button" data-room-reaction="love" title="Love" aria-label="Send Love reaction" disabled><img src="https://i.ibb.co/dwKS1HZV/love.png" alt=""><span class="sr-only">Love</span></button>
+                  <button class="online-reaction-button" type="button" data-room-reaction="laugh" title="Laugh" aria-label="Send Laugh reaction" disabled><img src="https://i.ibb.co/qLhR0gR5/Laugh.png" alt=""><span class="sr-only">Laugh</span></button>
+                  <button class="online-reaction-button" type="button" data-room-reaction="think" title="Think" aria-label="Send Think reaction" disabled><img src="https://i.ibb.co/5hx6Tcd6/thinking.png" alt=""><span class="sr-only">Think</span></button>
+                </div>
+                <button id="onlineMicButton" class="online-control" type="button" aria-label="Turn microphone on" title="Turn microphone on" aria-pressed="false" disabled><span aria-hidden="true"><span class="material-symbols-outlined">mic_off</span></span><span class="online-control-label sr-only">Turn microphone on</span></button>
+                <button id="onlineCameraButton" class="online-control" type="button" aria-label="Turn camera on" title="Turn camera on" aria-pressed="false" disabled><span aria-hidden="true"><span class="material-symbols-outlined">videocam_off</span></span><span class="online-control-label sr-only">Turn camera on</span></button>
+                <button id="onlineShareButton" class="online-control" type="button" aria-label="Share screen" title="Share screen" aria-pressed="false" disabled><span aria-hidden="true"><span class="material-symbols-outlined">screen_share</span></span><span class="online-control-label sr-only">Share screen</span></button>
+                <button id="onlineHandButton" class="online-control" type="button" aria-label="Raise hand" title="Raise hand" aria-pressed="false" disabled><span aria-hidden="true"><span class="material-symbols-outlined">front_hand</span></span><span class="online-control-label sr-only">Raise hand</span></button>
+              </div>
+            </section>
+            <aside id="onlineRoomSidebar" class="online-room-sidebar">
+              <div class="online-sidebar-tabs" role="tablist" aria-label="Room sidebar">
+                <button id="onlineChatTab" class="online-sidebar-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="onlineChatPanel">Chat</button>
+                <button id="onlineHandsTab" class="online-sidebar-tab" type="button" role="tab" aria-selected="false" aria-controls="onlineHandsPanel">Hands <span id="onlineHandsCount" class="count-pill">0</span></button>
+              </div>
+              <section id="onlineChatPanel" class="online-chat-panel" role="tabpanel" aria-labelledby="onlineChatTab">
+                <div id="onlineChatMessages" class="online-chat-messages" role="log" aria-live="polite" aria-relevant="additions">
+                  <p class="online-chat-empty">Messages appear here while you’re in the room.</p>
+                </div>
+                <form id="onlineChatForm" class="online-chat-form">
+                  <label class="sr-only" for="onlineChatInput">Message everyone in the room</label>
+                  <textarea id="onlineChatInput" maxlength="500" rows="2" placeholder="Message everyone…" required></textarea>
+                  <button class="btn btn-primary btn-small" type="submit">Send</button>
+                </form>
+                <p class="online-chat-note">Room chat is live only and isn’t saved.</p>
+              </section>
+              <section id="onlineHandsPanel" class="online-roster-block online-hands-panel hidden" role="tabpanel" aria-labelledby="onlineHandsTab" hidden>
+                <h3>Raised hands</h3>
+                <p class="panel-hint">Your facilitator can use this queue to call on members.</p>
+                <button id="onlineHandVoiceButton" class="online-voice-alert-toggle hidden" type="button" aria-pressed="false"><span class="material-symbols-outlined" aria-hidden="true">volume_up</span> Turn on spoken hand alerts</button>
+                <div id="onlineHandsList" class="online-hands-list"><p class="online-empty-hands">No hands raised yet.</p></div>
+              </section>
+              <div class="online-room-guidance"><strong>Joining from a phone?</strong><p>Allow microphone/camera access when prompted. To share your screen, tap Share screen and approve the phone’s system prompt; some mobile browsers do not support screen capture.</p></div>
+            </aside>
+          </div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer"><div class="container footer-wrap"><div class="footer-info"><strong>NAWRAS EDU</strong><span>Learn • Build • Grow</span></div><span class="footer-copy">© <span id="year"></span> NAWRAS EDU</span></div></footer>
+  <script type="module" src="nawras-online.js"></script>
+</body>
+</html>
