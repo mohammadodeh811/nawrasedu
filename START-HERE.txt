@@ -1,0 +1,174 @@
+NAWRAS EDU — Academy updates
+============================
+
+This download contains ONLY changed website/configuration files and one NEW,
+separate Firebase backend. It is not a replacement for the whole website.
+No canvas, push-notification setup, or public schedule page has been added.
+
+WHAT CHANGED
+------------
+1. The Leaders ACCOUNT ROLE can create tasks for non-Admin account roles,
+   enter an optional deadline, edit its own tasks and review their submissions.
+   Position-leader appointments remain separate. A position leader still
+   manages their appointed team's tasks through the existing permissions.
+   Leaders cannot award their own submissions or assign Admin/position-leader
+   tasks through this new built-in Leaders-role right. Existing explicit
+   dashboard grants and Admin rights are retained.
+
+2. Non-Admin session lists, direct Firestore reads, calendars, attendance,
+   nested room data and new session notices are restricted to the member's
+   actual account role/university, all-member sessions or explicit individual
+   invitations. A resource/dashboard/position-leader grant is not membership
+   of another account role. Admins retain their management oversight.
+   Historical session notices that are no longer accessible are hidden in the
+   website inbox. Already-delivered historical inbox copies are not erased
+   from Firestore by this update.
+
+3. Admins have Delete account in Team members, with confirmation.
+   Deletion uses a callable Firebase function: the browser cannot directly
+   delete another Firebase Authentication account. Self-deletion and deletion
+   of other Admin accounts from this tool are blocked.
+
+4. Admins can Publish academy event in My calendar. An event has a title,
+   description, start/end date/time and All roles or one role as its audience.
+   Matching members see it in their personal calendar/overview and receive
+   an in-site inbox notice. Only Admins edit/delete the shared event globally.
+   Members may set their own status or hide it from their own calendar.
+
+CHANGED WEBSITE / CONFIGURATION FILES
+------------------------------------
+app.js
+nawras-online.js
+personal-calendar.js
+personal-calendar-core.js
+dashboard-permissions.js
+dashboard-permissions.css
+firestore.rules
+firestore.indexes.json
+firebase.json
+
+NEW BACKEND FILES
+-----------------
+academy-admin-functions/index.js
+academy-admin-functions/package.json
+
+admin.html and the main styles.css are unchanged and are NOT in this archive.
+Keep your latest existing versions, along with firebase-config.js and all
+other website files. Keep any existing functions/ folder unchanged.
+
+INSTALL — DO THIS BEFORE TRYING ACCOUNT DELETION
+-----------------------------------------------
+1. Back up your website and Firebase configuration.
+
+2. Extract the download into your LOCAL website project folder.
+   The supplied JavaScript/CSS files go beside your existing app.js.
+   Keep the new academy-admin-functions folder at that same project root.
+
+   Your uploaded firebase.json already referenced functions/. The supplied
+   version preserves that default codebase and adds academy-admin as a
+   separate codebase. It does not overwrite your existing functions source.
+   If your current firebase.json has additional Hosting/Storage/Emulator
+   settings, KEEP those settings and merge the new functions codebase rather
+   than replacing the entire configuration.
+
+3. If needed, install Node.js 22 and the Firebase CLI on your computer.
+   In a terminal opened in the folder containing firebase.json, run:
+
+     npm install -g firebase-tools
+     firebase login
+     firebase use --add
+
+   Select the SAME Firebase project used by your existing website.
+   You do not need to put any private API key in website JavaScript.
+
+4. Install the new backend's dependencies:
+
+     npm --prefix academy-admin-functions install
+
+5. Deploy the updated database rules and indexes:
+
+     firebase deploy --only firestore:rules,firestore:indexes
+
+   These are Firestore Database rules, NOT Storage rules.
+   Wait for the indexes to show Enabled in Firebase Console >
+   Firestore Database > Indexes before using account deletion.
+   Retain unrelated existing indexes; review any deletion prompts carefully.
+   Publishing rules alone is not a substitute for deploying the indexes.
+
+6. Deploy ONLY the new backend codebase:
+
+     firebase deploy --only functions:academy-admin
+
+   This adds deleteAcademyUser in us-central1. It does not deploy or replace
+   the existing default functions codebase. Cloud Functions deployment needs
+   billing enabled on the Firebase project, normally the Blaze plan.
+   Do not approve deleting unrelated existing functions.
+
+7. Publish the changed website JavaScript/CSS files through your normal
+   website-hosting method, then hard-refresh the site on each device.
+   Do not upload firebase.json, rules or backend source into a public assets
+   directory instead of deploying them with the CLI.
+
+8. Verify with disposable accounts:
+   - Leaders > Tasks: create a Technical task and confirm Technical sees it.
+   - A different role must not see a Technical-only session via its direct
+     URL, calendar, session list or attendance tools.
+   - Admin > My calendar > Publish academy event: test one role, then All.
+   - Admin > Team members: delete a TEST member, not a real account first.
+     Confirm its old credentials no longer sign in to that same account.
+
+ACCOUNT-DELETION DATA HANDLING
+-----------------------------
+The server checks the caller's current active Admin profile, blocks the
+target profile, removes its Firebase Auth account, and cleans up:
+  - profile/subcollections, inbox, personal calendar and old token records;
+  - rating sheet, individual grants, course assignments, private open questions;
+  - private chat threads involving that account;
+  - that user's task submissions and their associated submission counters;
+  - their attendance overrides, visit records and raised-hand records;
+  - notices authored by that account, plus targeted-session membership.
+
+Shared tasks, forms, courses, resources and academy events are retained.
+Anonymous form responses are retained; they cannot reliably be attributed to
+an account. Public answered questions remain, with removed-account identity
+references anonymized. A small server-only deletedAccounts UID tombstone
+prevents an old ID token from recreating the removed profile.
+This deletes an account; it does not ban its email address from future
+registration as a NEW User account.
+
+If cleanup fails after sign-in removal, the inactive profile remains marked
+Deletion pending. Admins can use Finish deletion to retry safely. Do not
+manually reactivate that partially deleted profile.
+
+IMPORTANT REMAINING LIVE-VIDEO BACKEND CHECK
+------------------------------------------
+The website uses a SEPARATE Cloudflare video-token worker, referenced in
+nawras-online.js. Its source was not among the supplied files.
+
+The delivered rules protect Firestore session data and the website queries;
+they do not change that external worker. Complete live-room privacy cannot be
+claimed until the token server is checked too. Upload that worker's source
+WITHOUT secrets so its token endpoint can be checked/updated to verify:
+  - the Firebase ID token and current active member profile;
+  - the requested session's actual role/university/invited-member audience;
+  - host rights for that specific room, without trusting browser-sent roles.
+
+Previously issued video tokens are also controlled by the video backend,
+not by these Firestore rules. Existing historical inbox copies and already
+viewed data cannot be retracted by browser-side filtering.
+
+VERIFICATION PERFORMED HERE
+---------------------------
+Local Firestore emulator: 79 targeted checks and 56 access regression checks.
+These included direct cross-role document/nested-data requests, scoped
+queries, task create/review/XP, calendar rules and protected account signup.
+Task-editor, calendar-core and 38-capability regression tests passed.
+The deletion function's authorization, retry and cleanup were tested with a
+mocked Admin SDK; no real Firebase account was deleted.
+Chromium checked startup/login error handling, Leader task controls, calendar
+editor and Admin deletion confirmation at 375px, 768px and 1280px using mocked
+Firebase responses.
+
+No production deployment, real sign-in, live video token request or real
+account deletion was performed. Use the disposable-account checks above
+after deployment.

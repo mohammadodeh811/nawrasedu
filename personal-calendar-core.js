@@ -13,7 +13,9 @@ export function localDayKey(value) {
 
 export function isSessionForMember(session, member) {
   if (!member?.uid || session.status === "cancelled") return false;
-  if (Array.isArray(session.targetMemberUids) && session.targetMemberUids.includes(member.uid)) return true;
+  if (session.audienceRole === "targeted") {
+    return Array.isArray(session.targetMemberUids) && session.targetMemberUids.includes(member.uid);
+  }
   const roleMatches = session.audienceRole === "all" || session.audienceRole === member.role;
   const universityMatches = !session.audienceUniversityTag || session.audienceUniversityTag === member.universityTag;
   return roleMatches && universityMatches;

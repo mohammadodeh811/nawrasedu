@@ -6,17 +6,6 @@
   <link rel="manifest" href="manifest.json">
   <meta name="description" content="Ask the NAWRAS EDU team and learn from public answers."><title>Ask Nawras | NAWRAS EDU</title>
   <link rel="icon" type="image/png" href="https://nawrasedu.site.je/icoom.png"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap" rel="stylesheet"><link rel="stylesheet" href="styles.css">
-  <script src="https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js" defer></script>
-  <script>
-    window.OneSignalDeferred = window.OneSignalDeferred || [];
-    OneSignalDeferred.push(async function(OneSignal) {
-      await OneSignal.init({
-        appId: "524ac1d6-c661-4460-9b72-a91281e60623",
-        serviceWorkerPath: "firebase-messaging-sw.js",
-        serviceWorkerParam: { scope: "/" }
-      });
-    });
-  </script>
 </head>
 <body data-page="ask">
   <div id="toastRoot" class="toast-root" aria-live="polite"></div>

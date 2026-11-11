@@ -1,0 +1,93 @@
+/* Calendar controls remain touch-friendly without widening the month grid. */
+.planner-toolbar-actions { display:flex; flex-wrap:wrap; gap:.65rem; align-items:center; max-width:100%; }
+.planner-toolbar-actions .btn { min-height:44px; white-space:normal; }
+@media (max-width:600px) {
+  .planner-toolbar-actions { width:100%; }
+  .planner-toolbar-actions .btn { flex:1 1 100%; }
+  .planner-dialog { max-width:calc(100vw - 2rem); box-sizing:border-box; }
+  .planner-form-dates { min-width:0; }
+  .planner-form-dates input { max-width:100%; min-width:0; }
+}
+/* Dashboard-only refinements. The public site's existing stylesheet is unchanged. */
+#dashboard .panel-heading .panel-kicker,
+#dashboard #roleWorkspace {
+  display: none !important;
+}
+.permission-help {
+  margin: 0 0 18px;
+  color: var(--muted);
+  font-size: .85rem;
+}
+.permission-help summary {
+  cursor: pointer;
+  padding: 9px 0;
+  font-weight: 600;
+}
+.permission-help p { max-width: 76ch; line-height: 1.65; }
+.permission-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 12px;
+}
+.permission-toolbar > label { flex: 1 1 240px; min-width: 0; }
+.permission-toolbar > div { display: flex; flex-wrap: wrap; gap: 8px; }
+.permission-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 12px;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+  min-inline-size: 0;
+}
+.permission-group {
+  min-width: 0;
+  border: 1px solid var(--line, #e1e6ed);
+  border-radius: 14px;
+  background: #fff;
+  overflow: hidden;
+}
+.permission-group[hidden] { display: none; }
+.permission-group summary {
+  cursor: pointer;
+  min-height: 48px;
+  padding: 14px 16px;
+  color: var(--navy, #18344b);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+.permission-group[open] summary { border-bottom: 1px solid var(--line, #e1e6ed); }
+.permission-group-options { display: grid; gap: 2px; padding: 8px; }
+.permission-group-options .check-row {
+  min-height: 44px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  border-radius: 9px;
+  padding: 11px 8px;
+  cursor: pointer;
+  line-height: 1.45;
+}
+.permission-group-options .check-row:hover { background: #f5f7fa; }
+.permission-group-options input { flex: 0 0 auto; margin-top: 3px; width: 17px; height: 17px; }
+.permission-group-options span { min-width: 0; overflow-wrap: anywhere; font-size: .85rem; }
+.permission-sensitive { display: inline-block; margin-left: 8px; font-size: .68rem; color: #a32c2c; }
+.permission-group summary:focus-visible,
+.permission-group-options input:focus-visible { outline: 3px solid #5a86d8; outline-offset: 2px; }
+.session-library-list { display: grid; gap: 12px; }
+.session-library-card { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px; border: 1px solid var(--line); border-radius: 14px; min-width: 0; }
+.session-library-card > div { min-width: 0; overflow-wrap: anywhere; }
+.session-library-card p { margin: 5px 0 0; font-size: .8rem; color: var(--muted); }
+.member-assignment-details { min-width: 0; width: 100%; }
+.member-assignment-details > summary { cursor: pointer; font-weight: 600; padding: 12px 0; min-height: 44px; }
+.member-assignment-details > form { margin-top: 8px; }
+@media (max-width: 700px) {
+  .permission-grid { grid-template-columns: minmax(0, 1fr); }
+  .permission-toolbar { align-items: stretch; }
+  .permission-toolbar > div { width: 100%; }
+  .permission-toolbar button { min-height: 44px; flex: 1; }
+  .session-library-card { align-items: flex-start; flex-direction: column; }
+}

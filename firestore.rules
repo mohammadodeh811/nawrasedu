@@ -16,6 +16,359 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.role == role;
     }
 
+    function validWorkflowRole(role) {
+      return role in ["user", "leaders", "public", "tech", "social", "designers", "content", "event"];
+    }
+
+    function canCreateCrossTeamWorkflow() {
+      return roleIs("admin") || leadsTeamRole("event");
+    }
+
+    function workflowHasMemberRole(workflow, memberRoles) {
+      return memberRoles is list && (
+        (memberRoles.hasAny(["user"]) && workflow.get("participantRoles", []).hasAny(["user"]))
+        || (memberRoles.hasAny(["leaders"]) && workflow.get("participantRoles", []).hasAny(["leaders"]))
+        || (memberRoles.hasAny(["public"]) && workflow.get("participantRoles", []).hasAny(["public"]))
+        || (memberRoles.hasAny(["tech"]) && workflow.get("participantRoles", []).hasAny(["tech"]))
+        || (memberRoles.hasAny(["social"]) && workflow.get("participantRoles", []).hasAny(["social"]))
+        || (memberRoles.hasAny(["designers"]) && workflow.get("participantRoles", []).hasAny(["designers"]))
+        || (memberRoles.hasAny(["content"]) && workflow.get("participantRoles", []).hasAny(["content"]))
+        || (memberRoles.hasAny(["event"]) && workflow.get("participantRoles", []).hasAny(["event"]))
+      );
+    }
+
+    function canReadCrossTeamWorkflow(workflow) {
+      let profile = get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data;
+      return member() && (profile.get("role", "") == "admin"
+        || workflow.get("createdByUid", "") == request.auth.uid
+        || workflow.get("participantRoles", []).hasAny([profile.get("role", "")])
+        || workflow.get("participantUids", []).hasAny([request.auth.uid])
+        || workflowHasMemberRole(workflow, profile.get("dashboardRoles", []))
+        || workflowHasMemberRole(workflow, profile.get("teamLeadRoles", [])));
+    }
+
+    function crossTeamWorkflowPath(workflowId) {
+      return /databases/$(database)/documents/crossTeamWorkflows/$(workflowId);
+    }
+
+    function crossTeamStagePath(workflowId, stageId) {
+      return /databases/$(database)/documents/crossTeamWorkflows/$(workflowId)/stages/$(stageId);
+    }
+
+    function workflowStageActor(stage) {
+      let profile = get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data;
+      return member() && (
+        profile.get("role", "") == "admin"
+        || (profile.get("role", "") == stage.get("teamRole", "")
+          && (stage.get("assignedMemberUids", []).size() == 0
+            || stage.get("assignedMemberUids", []).hasAny([request.auth.uid])))
+        || (profile.get("teamLeadRoles", []) is list
+          && profile.get("teamLeadRoles", []).hasAny([stage.get("teamRole", "")]))
+      );
+    }
+
+    function canLogWorkflowStageActivity(workflow, stage) {
+      return workflowStageActor(stage)
+        && (
+          (workflow.get("status", "") == "active"
+            && stage.get("stageIndex", -1) == workflow.get("currentStageIndex", -2)
+            && stage.get("status", "") in ["in_progress", "needs_revision", "submitted"])
+          || (workflow.get("status", "") == "active"
+            && stage.get("status", "") == "completed"
+            && stage.get("stageIndex", -1) + 1 == workflow.get("currentStageIndex", -2))
+          || (workflow.get("status", "") == "completed"
+            && stage.get("status", "") == "completed"
+            && stage.get("stageIndex", -1) == workflow.get("currentStageIndex", -2))
+        );
+    }
+
+    function canWorkCurrentWorkflowStage(workflow, stage) {
+      return workflow.get("status", "") == "active"
+        && stage.get("stageIndex", -1) == workflow.get("currentStageIndex", -2)
+        && stage.get("status", "") in ["in_progress", "needs_revision"]
+        && workflowStageActor(stage);
+    }
+
+    function workflowActivityTouchValid(workflowId, oldWorkflow, newWorkflow) {
+      let stageId = oldWorkflow.get("stageIds", [])[oldWorkflow.get("currentStageIndex", -1)];
+      let stage = get(crossTeamStagePath(workflowId, stageId)).data;
+      return member()
+        && canWorkCurrentWorkflowStage(oldWorkflow, stage)
+        && newWorkflow.diff(oldWorkflow).affectedKeys().hasOnly(["updatedAt", "lastActivityAt"])
+        && newWorkflow.updatedAt == request.time
+        && newWorkflow.lastActivityAt == request.time;
+    }
+
+    function validCrossTeamRoot(data) {
+      return data.keys().hasAll([
+          "id", "title", "description", "category", "priority", "deadline", "reviewMode",
+          "createdByUid", "createdByName", "createdByRole", "participantRoles", "stageRoles",
+          "participantUids", "referenceLinks", "stageIds", "currentStageIndex", "status",
+          "progress", "createdAt", "updatedAt", "lastActivityAt"
+        ])
+        && data.keys().hasOnly([
+          "id", "title", "description", "category", "priority", "deadline", "reviewMode",
+          "createdByUid", "createdByName", "createdByRole", "participantRoles", "stageRoles",
+          "participantUids", "referenceLinks", "stageIds", "currentStageIndex", "status",
+          "progress", "createdAt", "updatedAt", "lastActivityAt", "cancelReason"
+        ])
+        && data.id is string && data.id.size() >= 1 && data.id.size() <= 150
+        && data.title is string && data.title.size() >= 3 && data.title.size() <= 120
+        && data.description is string && data.description.size() >= 8 && data.description.size() <= 1000
+        && data.category is string && data.category.size() >= 1 && data.category.size() <= 80
+        && data.priority in ["Low", "Medium", "High", "Urgent"]
+        && (data.deadline == null || data.deadline is timestamp)
+        && data.reviewMode is bool
+        && data.createdByUid is string && data.createdByUid.size() >= 1
+        && data.createdByName is string && data.createdByName.size() >= 1 && data.createdByName.size() <= 80
+        && (data.createdByRole == "admin" || validWorkflowRole(data.createdByRole))
+        && data.participantRoles is list && data.participantRoles.size() >= 2 && data.participantRoles.size() <= 6
+        && data.participantRoles.hasOnly(["user", "leaders", "public", "tech", "social", "designers", "content", "event"])
+        && data.stageRoles is list && data.stageRoles.size() >= 2 && data.stageRoles.size() <= 6
+        && data.stageRoles.hasOnly(["user", "leaders", "public", "tech", "social", "designers", "content", "event"])
+        && data.participantRoles.hasAll(data.stageRoles)
+        && data.participantUids is list && data.participantUids.size() <= 160
+        && data.referenceLinks is list && data.referenceLinks.size() <= 3
+        && (data.referenceLinks.size() < 1 || validLinkEntry(data.referenceLinks[0]))
+        && (data.referenceLinks.size() < 2 || validLinkEntry(data.referenceLinks[1]))
+        && (data.referenceLinks.size() < 3 || validLinkEntry(data.referenceLinks[2]))
+        && data.stageIds is list && data.stageIds.size() == data.stageRoles.size()
+        && data.currentStageIndex is int && data.currentStageIndex >= 0 && data.currentStageIndex < data.stageIds.size()
+        && data.status in ["active", "paused", "completed", "cancelled"]
+        && (data.status != "cancelled" || data.get("cancelReason", "").size() >= 3)
+        && data.progress is int && data.progress >= 0 && data.progress <= 100
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time
+        && data.lastActivityAt == request.time
+        && (!data.keys().hasAny(["cancelReason"])
+          || (data.cancelReason is string && data.cancelReason.size() <= 500));
+    }
+
+    function workflowStageMatchesLayout(workflowId, data, index) {
+      let stageId = data.stageIds[index];
+      let stage = getAfter(crossTeamStagePath(workflowId, stageId)).data;
+      return stageId is string
+        && stageId.size() > 0
+        && stage.stageIndex == index
+        && stage.teamRole == data.stageRoles[index]
+        && stage.workflowId == workflowId;
+    }
+
+    function validWorkflowStageLayout(workflowId, data) {
+      return workflowStageMatchesLayout(workflowId, data, 0)
+        && workflowStageMatchesLayout(workflowId, data, 1)
+        && (data.stageIds.size() < 3 || workflowStageMatchesLayout(workflowId, data, 2))
+        && (data.stageIds.size() < 4 || workflowStageMatchesLayout(workflowId, data, 3))
+        && (data.stageIds.size() < 5 || workflowStageMatchesLayout(workflowId, data, 4))
+        && (data.stageIds.size() < 6 || workflowStageMatchesLayout(workflowId, data, 5));
+    }
+
+    function validCrossTeamStageLink(link) {
+      return link is map
+        && link.keys().hasAll(["label", "url", "sharedByUid", "sharedByName", "sharedByRole"])
+        && link.keys().hasOnly(["label", "url", "sharedByUid", "sharedByName", "sharedByRole"])
+        && link.label is string && link.label.size() >= 1 && link.label.size() <= 60
+        && link.url is string && link.url.size() <= 1000 && link.url.matches("^https?://.+")
+        && link.sharedByUid is string && link.sharedByUid.size() >= 1
+        && link.sharedByName is string && link.sharedByName.size() >= 1 && link.sharedByName.size() <= 80
+        && (link.sharedByRole == "admin" || validWorkflowRole(link.sharedByRole));
+    }
+
+    function validCrossTeamStageLinks(links) {
+      return links is list && links.size() <= 6
+        && (links.size() < 1 || validCrossTeamStageLink(links[0]))
+        && (links.size() < 2 || validCrossTeamStageLink(links[1]))
+        && (links.size() < 3 || validCrossTeamStageLink(links[2]))
+        && (links.size() < 4 || validCrossTeamStageLink(links[3]))
+        && (links.size() < 5 || validCrossTeamStageLink(links[4]))
+        && (links.size() < 6 || validCrossTeamStageLink(links[5]));
+    }
+
+    function validCrossTeamStage(data) {
+      return data.keys().hasAll([
+          "workflowId", "stageId", "stageIndex", "teamRole", "instructions", "dueAt",
+          "assignedMemberUids", "status", "links", "handoverNote", "createdAt", "updatedAt"
+        ])
+        && data.keys().hasOnly([
+          "workflowId", "stageId", "stageIndex", "teamRole", "instructions", "dueAt",
+          "assignedMemberUids", "status", "links", "handoverNote", "createdAt", "updatedAt",
+          "startedAt", "submittedAt", "reviewedAt", "reviewedByUid", "updatedByUid"
+        ])
+        && data.workflowId is string && data.workflowId.size() > 0
+        && data.stageId is string && data.stageId.size() > 0
+        && data.stageIndex is int && data.stageIndex >= 0 && data.stageIndex < 6
+        && validWorkflowRole(data.teamRole)
+        && data.instructions is string && data.instructions.size() <= 1000
+        && (data.dueAt == null || data.dueAt is timestamp)
+        && data.assignedMemberUids is list && data.assignedMemberUids.size() <= 20
+        && data.status in ["pending", "in_progress", "submitted", "needs_revision", "completed", "blocked"]
+        && validCrossTeamStageLinks(data.links)
+        && data.handoverNote is string && data.handoverNote.size() <= 1500
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time
+        && (!data.keys().hasAny(["startedAt"]) || data.startedAt is timestamp)
+        && (!data.keys().hasAny(["submittedAt"]) || data.submittedAt is timestamp)
+        && (!data.keys().hasAny(["reviewedAt"]) || data.reviewedAt is timestamp)
+        && (!data.keys().hasAny(["reviewedByUid"]) || data.reviewedByUid is string)
+        && (!data.keys().hasAny(["updatedByUid"]) || data.updatedByUid is string);
+    }
+
+    function workflowAdminStageUpdate() {
+      return roleIs("admin")
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "stageIndex", "teamRole", "instructions", "dueAt", "assignedMemberUids", "status",
+          "links", "handoverNote", "updatedAt", "startedAt", "submittedAt", "reviewedAt",
+          "reviewedByUid", "updatedByUid"
+        ])
+        && request.resource.data.workflowId == resource.data.workflowId
+        && request.resource.data.stageId == resource.data.stageId
+        && request.resource.data.createdAt == resource.data.createdAt
+        && validCrossTeamStage(request.resource.data);
+    }
+
+    function workflowMemberStageUpdate(workflow) {
+      let previousLinkCount = resource.data.links.size();
+      return canWorkCurrentWorkflowStage(workflow, resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "status", "links", "handoverNote", "updatedAt", "submittedAt", "updatedByUid"
+        ])
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.get("updatedByUid", request.auth.uid) == request.auth.uid
+        && request.resource.data.handoverNote is string
+        && request.resource.data.handoverNote.size() <= 1500
+        && request.resource.data.links is list
+        && (request.resource.data.links == resource.data.links
+          || (previousLinkCount < 6
+            && request.resource.data.links.size() == previousLinkCount + 1
+            && request.resource.data.links.hasAll(resource.data.links)
+            && validCrossTeamStageLink(request.resource.data.links[previousLinkCount])
+            && request.resource.data.links[previousLinkCount].sharedByUid == request.auth.uid
+            && request.resource.data.links[previousLinkCount].sharedByRole == memberRole()
+            && request.resource.data.links[previousLinkCount].sharedByName is string
+            && request.resource.data.links[previousLinkCount].sharedByName.size() >= 1
+            && request.resource.data.links[previousLinkCount].sharedByName.size() <= 80))
+        && (
+          (request.resource.data.status == resource.data.status
+            && resource.data.status in ["in_progress", "needs_revision"])
+          || (request.resource.data.status == "submitted"
+            && workflow.get("reviewMode", false) == true)
+          || (request.resource.data.status == "completed"
+            && workflow.get("reviewMode", true) == false
+            && workflowDirectHandoverValid(workflow.id, workflow,
+              getAfter(crossTeamWorkflowPath(workflow.id)).data))
+        )
+        && (!request.resource.data.keys().hasAny(["submittedAt"])
+          || request.resource.data.submittedAt is timestamp);
+    }
+
+    function workflowNextStageActivation(workflow) {
+      let index = workflow.currentStageIndex;
+      let previous = get(crossTeamStagePath(workflow.id, workflow.stageIds[index])).data;
+      let previousAfter = getAfter(crossTeamStagePath(workflow.id, workflow.stageIds[index])).data;
+      let nextWorkflow = getAfter(crossTeamWorkflowPath(workflow.id)).data;
+      return resource.data.stageIndex == index + 1
+        && workflow.status == "active"
+        && workflow.reviewMode == false
+        && resource.data.status == "pending"
+        && canWorkCurrentWorkflowStage(workflow, previous)
+        && previousAfter.status == "completed"
+        && nextWorkflow.currentStageIndex == resource.data.stageIndex
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "status", "startedAt", "updatedAt"
+        ])
+        && request.resource.data.status == "in_progress"
+        && request.resource.data.startedAt == request.time
+        && request.resource.data.updatedAt == request.time;
+    }
+
+    function workflowDirectHandoverValid(workflowId, oldWorkflow, newWorkflow) {
+      let index = oldWorkflow.get("currentStageIndex", -1);
+      let currentId = oldWorkflow.get("stageIds", [])[index];
+      let currentAfter = getAfter(crossTeamStagePath(workflowId, currentId)).data;
+      return oldWorkflow.status == "active"
+        && oldWorkflow.reviewMode == false
+        && newWorkflow.diff(oldWorkflow).affectedKeys().hasOnly(["currentStageIndex", "status", "progress", "updatedAt", "lastActivityAt"])
+        && currentAfter.status == "completed"
+        && newWorkflow.progress is int
+        && newWorkflow.progress >= oldWorkflow.get("progress", 0)
+        && newWorkflow.progress <= 100
+        && (index < oldWorkflow.stageIds.size() - 1 || newWorkflow.progress == 100)
+        && (
+          (index < oldWorkflow.stageIds.size() - 1
+            && newWorkflow.currentStageIndex == index + 1
+            && newWorkflow.status == "active"
+            && getAfter(crossTeamStagePath(workflowId, oldWorkflow.stageIds[index + 1])).data.status == "in_progress")
+          || (index == oldWorkflow.stageIds.size() - 1
+            && newWorkflow.currentStageIndex == index
+            && newWorkflow.status == "completed")
+        )
+        && newWorkflow.updatedAt == request.time
+        && newWorkflow.lastActivityAt == request.time;
+    }
+
+    function workflowReviewHandoverValid(workflowId, oldWorkflow, newWorkflow) {
+      let index = oldWorkflow.get("currentStageIndex", -1);
+      let currentId = oldWorkflow.get("stageIds", [])[index];
+      let currentAfter = getAfter(crossTeamStagePath(workflowId, currentId)).data;
+      return roleIs("admin")
+        && oldWorkflow.status == "active"
+        && oldWorkflow.reviewMode == true
+        && currentAfter.status == "completed"
+        && (
+          (index < oldWorkflow.stageIds.size() - 1
+            && newWorkflow.currentStageIndex == index + 1
+            && newWorkflow.status == "active"
+            && getAfter(crossTeamStagePath(workflowId, oldWorkflow.stageIds[index + 1])).data.status == "in_progress")
+          || (index == oldWorkflow.stageIds.size() - 1
+            && newWorkflow.currentStageIndex == index
+            && newWorkflow.status == "completed")
+        )
+        && newWorkflow.progress is int
+        && newWorkflow.progress >= oldWorkflow.get("progress", 0)
+        && newWorkflow.progress <= 100
+        && (index < oldWorkflow.stageIds.size() - 1 || newWorkflow.progress == 100);
+    }
+
+    function workflowRecipientMatches(workflow, uid) {
+      let profile = get(/databases/$(database)/documents/teamMembers/$(uid)).data;
+      return profile.get("active", false) == true
+        && (profile.get("role", "") == "admin"
+          || workflow.get("createdByUid", "") == uid
+          || workflow.get("participantRoles", []).hasAny([profile.get("role", "")])
+          || workflow.get("participantUids", []).hasAny([uid])
+          || workflowHasMemberRole(workflow, profile.get("dashboardRoles", []))
+          || workflowHasMemberRole(workflow, profile.get("teamLeadRoles", [])));
+    }
+
+    function canNotifyCrossTeamWorkflow(workflowId, stageId) {
+      let workflow = get(crossTeamWorkflowPath(workflowId)).data;
+      let profile = get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data;
+      let currentIndex = workflow.get("currentStageIndex", -1);
+      let currentStage = get(crossTeamStagePath(workflowId, workflow.stageIds[currentIndex])).data;
+      let previousStage = currentIndex > 0
+        ? get(crossTeamStagePath(workflowId, workflow.stageIds[currentIndex - 1])).data
+        : {};
+      let nextStageId = currentIndex < workflow.stageIds.size() - 1
+        ? workflow.stageIds[currentIndex + 1]
+        : "";
+      return member() && (profile.get("role", "") == "admin"
+        || workflow.get("createdByUid", "") == request.auth.uid
+        || (stageId is string && stageId.size() > 0 && (
+          (stageId == workflow.stageIds[currentIndex]
+            && workflowStageActor(currentStage))
+          || (workflow.status == "active"
+            && workflow.reviewMode == true
+            && stageId == nextStageId
+            && currentStage.status == "submitted"
+            && workflowStageActor(currentStage))
+          || (currentIndex > 0
+            && workflow.status == "active"
+            && stageId == workflow.stageIds[currentIndex]
+            && previousStage.status == "completed"
+            && workflowStageActor(previousStage))
+        )));
+    }
+
     function dashboardGrantActive(grantId) {
       return exists(/databases/$(database)/documents/dashboardAccessGrants/$(grantId))
         && get(/databases/$(database)/documents/dashboardAccessGrants/$(grantId)).data.get("active", false) == true;
@@ -46,12 +399,17 @@ service cloud.firestore {
     }
 
     function hasDashboardAccess(capability) {
-      return member() && (
-        roleIs("admin")
+      return member() && activeMemberDashboardAccess(capability);
+    }
+
+    function activeMemberDashboardAccess(capability) {
+      let profile = get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data;
+      return (
+        profile.role == "admin"
         || dashboardGrantActive("user_" + request.auth.uid + "_" + capability)
-        || dashboardGrantActive("role_" + memberRole() + "_" + capability)
-        || (get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get("universityTag", "") != ""
-          && dashboardGrantActive("university_" + get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get("universityTag", "") + "_" + capability))
+        || dashboardGrantActive("role_" + profile.role + "_" + capability)
+        || (profile.get("universityTag", "") != ""
+          && dashboardGrantActive("university_" + profile.get("universityTag", "") + "_" + capability))
       );
     }
 
@@ -63,6 +421,95 @@ service cloud.firestore {
         && ((grant.scopeType == "user" && grant.scopeTarget == uid)
           || (grant.scopeType == "role" && grant.scopeTarget == profile.get("role", ""))
           || (grant.scopeType == "university" && grant.scopeTarget == profile.get("universityTag", "")));
+    }
+
+    function validDashboardCapability(key) {
+      return key in [
+        "formsManage", "formsRead", "formsResponses", "coursesManage", "coursesRead",
+        "technicalMaterialsManage", "technicalMaterialsRead", "designerResourcesRead", "designerResourcesManage",
+        "tasksRead", "tasksManage", "questionsRead", "questionsManage", "teamRead", "membersManage",
+        "xpManage", "ratingsRead", "ratingsManage", "xpReset", "ratingsReset",
+        "sessionsRead", "sessionsManage", "attendanceRead", "attendanceManage",
+        "resources_userRead", "resources_userManage", "resources_leadersRead", "resources_leadersManage",
+        "resources_publicRead", "resources_publicManage", "resources_techRead", "resources_techManage",
+        "resources_socialRead", "resources_socialManage", "resources_contentRead", "resources_contentManage",
+        "resources_eventRead", "resources_eventManage"
+      ];
+    }
+
+    function delegatedMemberTarget(uid) {
+      return member() && uid != request.auth.uid
+        && exists(/databases/$(database)/documents/teamMembers/$(uid))
+        && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true
+        && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "") != "admin";
+    }
+
+    function canAssignMember(uid) {
+      return roleIs("admin") || (hasDashboardAccess("membersManage") && delegatedMemberTarget(uid));
+    }
+    function canAdjustMemberXp(uid) {
+      return canManageTeamMember(uid) || (hasDashboardAccess("xpManage") && delegatedMemberTarget(uid));
+    }
+    function canRateMember(uid) {
+      return canManageTeamMember(uid) || (hasDashboardAccess("ratingsManage") && delegatedMemberTarget(uid));
+    }
+    function canResetMember(uid, capability) {
+      return roleIs("admin") || (hasDashboardAccess(capability) && delegatedMemberTarget(uid));
+    }
+    function attendanceReader() { return hasDashboardAccess("attendanceRead"); }
+    function attendanceManager() { return hasDashboardAccess("attendanceManage"); }
+
+    function delegatedAssignmentsAreValid(uid) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "role", "dashboardRoles", "teamLeadRoles", "universityTag", "leadingUniversityTag", "updatedAt"
+        ])
+        && hasDashboardAccess("membersManage") && delegatedMemberTarget(uid)
+        && request.resource.data.active == resource.data.active
+        && request.resource.data.role in ["user", "leaders", "public", "tech", "social", "designers", "content", "event"]
+        && request.resource.data.get("dashboardRoles", []) is list
+        && request.resource.data.get("dashboardRoles", []).size() <= 8
+        && request.resource.data.get("dashboardRoles", []).hasOnly(["user", "leaders", "public", "tech", "social", "designers", "content", "event"])
+        && (request.resource.data.role == "user" || request.resource.data.get("dashboardRoles", []).size() == 0)
+        && request.resource.data.get("teamLeadRoles", []) is list
+        && request.resource.data.get("teamLeadRoles", []).size() <= 8
+        && request.resource.data.get("teamLeadRoles", []).hasOnly(["user", "leaders", "public", "tech", "social", "designers", "content", "event"])
+        && validUniversityTag(request.resource.data.get("universityTag", ""))
+        && validUniversityTag(request.resource.data.get("leadingUniversityTag", ""))
+        && request.resource.data.updatedAt == request.time;
+    }
+
+    function taskReviewAwardMatches(uid, taskId) {
+      let task = get(/databases/$(database)/documents/tasks/$(taskId)).data;
+      let before = get(/databases/$(database)/documents/tasks/$(taskId)/submissions/$(uid)).data;
+      let after = getAfter(/databases/$(database)/documents/tasks/$(taskId)/submissions/$(uid)).data;
+      return canManageTask(task)
+        && (roleIs("admin") || uid != request.auth.uid)
+        && before.status == "pending" && after.status == "approved"
+        && after.reviewedByUid == request.auth.uid && after.reviewedAt == request.time
+        && after.xpAwarded is int && after.xpAwarded >= 0 && after.xpAwarded <= task.xp
+        && request.resource.data.xp is int
+        && request.resource.data.xp == resource.data.get("xp", 0) + after.xpAwarded
+        && request.resource.data.tasksCompleted == resource.data.get("tasksCompleted", 0) + 1
+        && request.resource.data.level is int && request.resource.data.level >= 1
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.active == resource.data.active
+        && request.resource.data.updatedAt == request.time;
+    }
+    function validTaskReviewAward(uid) {
+      return member()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "xp", "level", "tasksCompleted", "lastTaskId", "updatedAt"
+        ])
+        && request.resource.data.get("lastTaskId", "") is string
+        && request.resource.data.get("lastTaskId", "").size() > 0
+        && request.resource.data.diff(resource.data).affectedKeys().hasAny(["tasksCompleted"])
+        && taskReviewAwardMatches(uid, request.resource.data.lastTaskId);
+    }
+    function validBulkXpReset(uid) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(["xp", "level", "updatedAt"])
+        && canResetMember(uid, "xpReset")
+        && request.resource.data.xp == 0 && request.resource.data.level == 1
+        && request.resource.data.updatedAt == request.time;
     }
 
     function dashboardAccessNotificationMatchesMember(uid) {
@@ -81,21 +528,50 @@ service cloud.firestore {
     function sessionAudienceMatchesMember(session, uid) {
       return exists(/databases/$(database)/documents/teamMembers/$(uid))
         && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true
-        && (session.get("targetMemberUids", []).hasAny([uid])
-          || ((session.get("audienceRole", "") == "all"
+        && (
+          (session.get("audienceRole", "") == "targeted"
+            && session.get("targetMemberUids", []).hasAny([uid]))
+          || (session.get("audienceRole", "") in [
+                "all", "user", "leaders", "public", "tech", "social", "designers", "content", "event"
+              ]
+            && (session.get("audienceRole", "") == "all"
               || session.get("audienceRole", "") == get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", ""))
             && (session.get("audienceUniversityTag", "") == ""
-              || session.get("audienceUniversityTag", "") == get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("universityTag", ""))));
+              || session.get("audienceUniversityTag", "") == get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("universityTag", "")))
+        );
     }
 
     function taskAudienceMatchesMember(task, uid) {
+      let profile = get(/databases/$(database)/documents/teamMembers/$(uid)).data;
+      let assigned = task.get("assignedMemberUids", []);
+      let universityTag = task.get("targetUniversityTag", "");
       return exists(/databases/$(database)/documents/teamMembers/$(uid))
-        && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true
-        && (get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "") == task.get("targetRole", "")
-          || (get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "") == "admin"
+        && profile.get("active", false) == true
+        && (universityTag == "" || universityTag == profile.get("universityTag", ""))
+        && assigned is list
+        && (task.get("audienceMode", "all") == "all"
+          || (task.get("audienceMode", "") == "selected" && assigned.hasAny([uid])))
+        && (profile.get("role", "") == task.get("targetRole", "")
+          || (profile.get("role", "") == "admin"
             && (task.get("targetRole", "") == "admin"
-              || get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("adminTeamAssignment", "") == "member:" + task.get("targetRole", "")
-              || get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("adminTeamAssignment", "") == "leader:" + task.get("targetRole", ""))));
+              || profile.get("adminTeamAssignment", "") == "member:" + task.get("targetRole", "")
+              || profile.get("adminTeamAssignment", "") == "leader:" + task.get("targetRole", "")))
+          || (task.get("targetRole", "") == "position_leaders" && isPositionLeader(uid)));
+    }
+
+    function isPositionLeader(uid) {
+      let profile = get(/databases/$(database)/documents/teamMembers/$(uid)).data;
+      return exists(/databases/$(database)/documents/teamMembers/$(uid))
+        && profile.get("active", false) == true
+        && (
+          (profile.get("teamLeadRoles", []) is list
+            && profile.get("teamLeadRoles", []).hasAny(["user", "leaders", "public", "tech", "social", "designers", "content", "event"]))
+          || (profile.get("role", "") == "admin"
+            && profile.get("adminTeamAssignment", "") in [
+              "leader:user", "leader:leaders", "leader:public", "leader:tech",
+              "leader:social", "leader:designers", "leader:content", "leader:event"
+            ])
+        );
     }
 
     function contentManager() {
@@ -137,6 +613,49 @@ service cloud.firestore {
         && (!links.keys().hasAny(["website"]) || (links.website is string && links.website.size() <= 500 && links.website.matches("^https://[a-z0-9-]+([.][a-z0-9-]+)+/[^\\s]*$")));
     }
 
+    function validPublicProfileArtItem(item) {
+      return item is map
+        && item.keys().hasAll(["id", "kind", "value", "x", "y", "rotation"])
+        && item.keys().hasOnly(["id", "kind", "value", "x", "y", "rotation", "scale", "stickerId"])
+        && item.id is string && item.id.size() >= 1 && item.id.size() <= 40
+        && item.kind in ["sticker", "note", "badge", "uploadedSticker"]
+        && item.value is string
+        && item.x is int && item.x >= 0 && item.x <= 100
+        && item.y is int && item.y >= 0 && item.y <= 100
+        && item.rotation is int && item.rotation >= -180 && item.rotation <= 180
+        && (!item.keys().hasAny(["scale"])
+          || (item.scale is int && item.scale >= 50 && item.scale <= 200))
+        && ((item.kind == "uploadedSticker"
+              && item.value.size() >= 1 && item.value.size() <= 160
+              && item.get("stickerId", "") is string
+              && item.get("stickerId", "").matches("^[A-Za-z0-9_-]{10,200}$"))
+          || (item.kind == "sticker" && !item.keys().hasAny(["stickerId"]) && item.value.size() >= 1 && item.value.size() <= 32)
+          || (item.kind == "note" && !item.keys().hasAny(["stickerId"]) && item.value.size() >= 1 && item.value.size() <= 80)
+          || (item.kind == "badge" && !item.keys().hasAny(["stickerId"]) && item.value.size() >= 1 && item.value.size() <= 32));
+    }
+
+    function validPublicProfileStickers(stickers) {
+      return stickers is list
+        && stickers.size() <= 12;
+    }
+
+    function validPublicProfileArt(items) {
+      return items is list
+        && items.size() <= 12
+        && (items.size() < 1 || validPublicProfileArtItem(items[0]))
+        && (items.size() < 2 || validPublicProfileArtItem(items[1]))
+        && (items.size() < 3 || validPublicProfileArtItem(items[2]))
+        && (items.size() < 4 || validPublicProfileArtItem(items[3]))
+        && (items.size() < 5 || validPublicProfileArtItem(items[4]))
+        && (items.size() < 6 || validPublicProfileArtItem(items[5]))
+        && (items.size() < 7 || validPublicProfileArtItem(items[6]))
+        && (items.size() < 8 || validPublicProfileArtItem(items[7]))
+        && (items.size() < 9 || validPublicProfileArtItem(items[8]))
+        && (items.size() < 10 || validPublicProfileArtItem(items[9]))
+        && (items.size() < 11 || validPublicProfileArtItem(items[10]))
+        && (items.size() < 12 || validPublicProfileArtItem(items[11]));
+    }
+
     function validUniversityTag(tag) {
       return tag == ""
         || tag == "AAUP-Jenin"
@@ -162,21 +681,118 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get("teamLeadRoles", []).hasAny([targetRole]);
     }
 
-    function canManageTeamMember(uid) {
+    function taskLeaderUniversityTag(profile) {
+      let assigned = profile.get("leadingUniversityTag", "");
+      return assigned != "" && validUniversityTag(assigned)
+        ? assigned
+        : profile.get("universityTag", "");
+    }
+
+    function canManageTasksForRole(targetRole) {
+      return roleIs("admin")
+        || (targetRole != "position_leaders" && leadsTeamRole(targetRole))
+        || (targetRole != "position_leaders" && hasDashboardAccess("tasksManage")
+          && (targetRole == memberRole() || leadsTeamRole(targetRole)));
+    }
+
+    function canManageTask(task) {
+      let profile = get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data;
+      return roleIs("admin")
+        || (canManageTasksForRole(task.get("targetRole", ""))
+          && (!roleIs("leaders")
+            || taskLeaderUniversityTag(profile) == ""
+            || task.get("targetUniversityTag", "") == taskLeaderUniversityTag(profile)))
+        || (roleIs("leaders") && task.get("createdBy", "") == request.auth.uid
+          && task.get("targetUniversityTag", "") == taskLeaderUniversityTag(profile));
+    }
+
+    function validTaskAudience(data) {
+      let assigned = data.get("assignedMemberUids", []);
+      return data.get("targetUniversityTag", "") is string
+        && validUniversityTag(data.get("targetUniversityTag", ""))
+        && assigned is list && assigned.size() <= 100
+        && data.get("audienceMode", "") in ["all", "selected"]
+        && ((data.audienceMode == "all" && assigned.size() == 0)
+          || (data.audienceMode == "selected" && assigned.size() >= 1));
+    }
+
+    function validTaskCreatorScope(data) {
+      let profile = get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data;
+      let leaderUniversityTag = taskLeaderUniversityTag(profile);
       return roleIs("admin")
         || (roleIs("leaders")
-          && request.auth.uid != uid
-          && exists(/databases/$(database)/documents/teamMembers/$(uid))
-          && get(/databases/$(database)/documents/teamMembers/$(uid)).data.active == true
-          && get(/databases/$(database)/documents/teamMembers/$(uid)).data.role != "admin"
-          && get(/databases/$(database)/documents/teamMembers/$(uid)).data.universityTag
-            == get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.leadingUniversityTag
-          && get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.leadingUniversityTag != "")
-        || (request.auth.uid != uid
-          && exists(/databases/$(database)/documents/teamMembers/$(uid))
-          && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true
-          && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "") != "admin"
-          && leadsTeamRole(get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "")));
+          && data.get("targetRole", "") != "admin"
+          && data.get("targetRole", "") != "position_leaders"
+          && leaderUniversityTag != ""
+          && data.get("targetUniversityTag", "") == leaderUniversityTag)
+        || (leadsTeamRole(data.get("targetRole", ""))
+          && data.get("targetRole", "") != "position_leaders"
+          && (!roleIs("leaders")
+            || data.get("targetUniversityTag", "") == leaderUniversityTag))
+        || (!roleIs("leaders") && hasDashboardAccess("tasksManage")
+          && data.get("targetRole", "") == memberRole()
+          && data.get("targetRole", "") != "position_leaders");
+    }
+
+    function canMigrateLegacyTaskAudience() {
+      let creatorUid = resource.data.get("createdBy", "");
+      let creatorPath = /databases/$(database)/documents/teamMembers/$(creatorUid);
+      let creatorIsUniversityLeader = exists(creatorPath)
+        && get(creatorPath).data.get("role", "") == "leaders";
+      let assigned = resource.data.get("assignedMemberUids", []);
+      let desiredUniversity = resource.data.keys().hasAny(["targetUniversityTag"])
+        ? resource.data.targetUniversityTag
+        : creatorIsUniversityLeader
+          ? taskLeaderUniversityTag(get(creatorPath).data)
+          : "";
+      let desiredMode = resource.data.keys().hasAny(["audienceMode"])
+        ? resource.data.audienceMode
+        : assigned.size() == 0 ? "all" : "selected";
+      return roleIs("admin")
+        && (!resource.data.keys().hasAny(["targetUniversityTag"])
+          || !resource.data.keys().hasAny(["assignedMemberUids"])
+          || !resource.data.keys().hasAny(["audienceMode"]))
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "targetUniversityTag", "assignedMemberUids", "audienceMode", "updatedAt"
+        ])
+        && request.resource.data.targetRole == resource.data.targetRole
+        && request.resource.data.targetUniversityTag == desiredUniversity
+        && validUniversityTag(desiredUniversity)
+        && assigned is list && assigned.size() <= 100
+        && request.resource.data.assignedMemberUids == assigned
+        && request.resource.data.audienceMode == desiredMode
+        && (desiredMode == "all" || desiredMode == "selected")
+        && request.resource.data.updatedAt == request.time;
+    }
+
+    function canReadRoleResources(targetRole) {
+      return member() && (
+        roleIs("admin")
+        || get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get("role", "") == targetRole
+        || get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get("teamLeadRoles", []).hasAny([targetRole])
+        || (targetRole == "leaders" && isPositionLeader(request.auth.uid))
+        || get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get("dashboardRoles", []).hasAny([targetRole])
+        || hasDashboardAccess(targetRole == "designers" ? "designerResourcesRead" : "resources_" + targetRole + "Read")
+      );
+    }
+
+    function canManageRoleResources(targetRole) {
+      return roleIs("admin") || leadsTeamRole(targetRole)
+        || hasDashboardAccess(targetRole == "designers" ? "designerResourcesManage" : "resources_" + targetRole + "Manage");
+    }
+
+    function canManageTeamMember(uid) {
+      return member() && scopedMemberManagement(uid);
+    }
+
+    function scopedMemberManagement(uid) {
+      let actor = get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data;
+      let target = get(/databases/$(database)/documents/teamMembers/$(uid)).data;
+      return actor.role == "admin"
+        || (uid != request.auth.uid && target.get("active", false) == true && target.get("role", "") != "admin"
+          && ((actor.role == "leaders" && taskLeaderUniversityTag(actor) != ""
+              && taskLeaderUniversityTag(actor) == target.get("universityTag", ""))
+            || actor.get("teamLeadRoles", []).hasAny([target.get("role", "")])));
     }
 
     function validRatingScores(scores) {
@@ -203,7 +819,7 @@ service cloud.firestore {
 
     function canAnswerQuestion(targetRole) {
       return member()
-        && (roleIs("admin")
+        && (hasDashboardAccess("questionsManage")
           || get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.role == targetRole);
     }
 
@@ -262,8 +878,12 @@ service cloud.firestore {
       return mode == "all" || mode == "first" || mode == "free";
     }
 
+    function validTaskDeadline(data) {
+      return !data.keys().hasAny(["dueAt"]) || data.dueAt == null || data.dueAt is timestamp;
+    }
+
     function validTaskRole(role) {
-      return role == "admin" || role == "user" || validQuestionRole(role);
+      return role == "admin" || role == "position_leaders" || role == "user" || validQuestionRole(role);
     }
 
     function validLinkEntry(link) {
@@ -285,6 +905,14 @@ service cloud.firestore {
           && (data.links.size() < 1 || validLinkEntry(data.links[0]))
           && (data.links.size() < 2 || validLinkEntry(data.links[1]))
           && (data.links.size() < 3 || validLinkEntry(data.links[2])));
+    }
+
+    function validFounderLinks(links) {
+      return links is list
+        && links.size() <= 3
+        && (links.size() < 1 || validLinkEntry(links[0]))
+        && (links.size() < 2 || validLinkEntry(links[1]))
+        && (links.size() < 3 || validLinkEntry(links[2]));
     }
 
     // Optional task assets: up to 6 { label, url } links.
@@ -312,6 +940,49 @@ service cloud.firestore {
         && (data.get("gameType", "") != "html" || data.get("gameHtml", "").size() >= 20);
     }
 
+    function validTaskCover(data) {
+      let fileId = data.get("coverDriveFileId", "");
+      let imageUrl = data.get("imageUrl", "");
+      return fileId is string && fileId.size() <= 200
+        && imageUrl is string && imageUrl.size() <= 1000
+        && (imageUrl == "" || imageUrl.matches("^https?://[^\\s]+$"))
+        && (fileId == "" || imageUrl == "")
+        && data.get("coverDriveFileName", "") is string
+        && data.get("coverDriveFileName", "").size() <= 160
+        && data.get("coverDriveMimeType", "") is string
+        && data.get("coverDriveMimeType", "").size() <= 120
+        && data.get("coverDriveSizeBytes", 0) is int
+        && data.get("coverDriveSizeBytes", 0) >= 0
+        && data.get("coverDriveSizeBytes", 0) <= 10485760
+        && data.get("coverDriveUploadedByUid", "") is string
+        && data.get("coverDriveUploadedByUid", "").size() <= 128
+        && data.get("coverDriveUploadedAt", "") is string
+        && data.get("coverDriveUploadedAt", "").size() <= 40
+        && (fileId == ""
+          ? data.get("coverDriveFileName", "") == ""
+            && data.get("coverDriveMimeType", "") == ""
+            && data.get("coverDriveSizeBytes", 0) == 0
+            && data.get("coverDriveUploadedByUid", "") == ""
+            && data.get("coverDriveUploadedAt", "") == ""
+          : data.keys().hasAll([
+              "coverDriveFileName", "coverDriveMimeType", "coverDriveSizeBytes",
+              "coverDriveUploadedByUid", "coverDriveUploadedAt"
+            ])
+            && data.coverDriveFileName.size() >= 1
+            && data.coverDriveMimeType in ["image/jpeg", "image/png", "image/webp"]
+            && data.coverDriveSizeBytes > 0
+            && data.coverDriveUploadedByUid.size() >= 1
+            && data.coverDriveUploadedAt.size() >= 1);
+    }
+
+    function validTaskCreatorDisplay(data) {
+      let name = data.get("createdByName", "");
+      let photo = data.get("createdByPhotoURL", "");
+      return name is string && name.size() <= 80
+        && photo is string && photo.size() <= 1000
+        && (photo == "" || photo.matches("^https?://[^\\s]+$"));
+    }
+
     // Optional result reported by the interactive page when the member finishes.
     function validGameResult(data) {
       return !data.keys().hasAny(["gameResult"])
@@ -327,29 +998,14 @@ service cloud.firestore {
           && data.gameResult.get("details", "").size() <= 2000);
     }
 
-    function adminAssignedToTaskRole(targetRole) {
-      let assignment = get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get("adminTeamAssignment", "");
-      return roleIs("admin") && (
-        (targetRole == "user" && assignment in ["member:user", "leader:user"])
-        || (targetRole == "leaders" && assignment in ["member:leaders", "leader:leaders"])
-        || (targetRole == "public" && assignment in ["member:public", "leader:public"])
-        || (targetRole == "tech" && assignment in ["member:tech", "leader:tech"])
-        || (targetRole == "social" && assignment in ["member:social", "leader:social"])
-        || (targetRole == "designers" && assignment in ["member:designers", "leader:designers"])
-        || (targetRole == "content" && assignment in ["member:content", "leader:content"])
-        || (targetRole == "event" && assignment in ["member:event", "leader:event"])
-      );
-    }
-
     function canSubmitTask(task) {
-      return member()
-        && (task.targetRole == memberRole()
-          || (roleIs("admin") && task.targetRole == "admin")
-          || adminAssignedToTaskRole(task.targetRole));
+      return member() && taskAudienceMatchesMember(task, request.auth.uid);
     }
 
     function canReadTask(task) {
-      return roleIs("admin") || (member() && task.targetRole == memberRole());
+      return roleIs("admin")
+        || canManageTask(task)
+        || (member() && taskAudienceMatchesMember(task, request.auth.uid));
     }
 
     function validChatParticipant(chat) {
@@ -369,18 +1025,20 @@ service cloud.firestore {
     }
 
     function sessionManager() {
-      return roleIs("admin") || roleIs("leaders");
+      return roleIs("admin") || roleIs("leaders") || hasDashboardAccess("sessionsManage");
+    }
+
+    function canManageOnlineSession(session) {
+      return roleIs("admin")
+        || (sessionManager()
+          && (session.get("audienceRole", "") == "all"
+            || session.get("audienceRole", "") == memberRole())
+          && sessionAudienceMatchesMember(session, request.auth.uid));
     }
 
     function canAccessOnlineSession(session) {
       return member()
-        && (sessionManager()
-          || session.get("targetMemberUids", []).hasAny([request.auth.uid])
-          || ((session.audienceRole == "all"
-              || session.audienceRole == memberRole())
-            && (!session.keys().hasAny(["audienceUniversityTag"])
-              || session.audienceUniversityTag == ""
-              || session.audienceUniversityTag == get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.universityTag)));
+        && (roleIs("admin") || sessionAudienceMatchesMember(session, request.auth.uid));
     }
 
     function validOnlineAudience(audienceRole) {
@@ -394,11 +1052,6 @@ service cloud.firestore {
         || audienceRole == "designers"
         || audienceRole == "content"
         || audienceRole == "event";
-    }
-
-    function onlineScheduleMatchesSession(sessionId, expectedStatus) {
-      return existsAfter(/databases/$(database)/documents/nawrasOnlineSessions/$(sessionId))
-        && getAfter(/databases/$(database)/documents/nawrasOnlineSessions/$(sessionId)).data.status == expectedStatus;
     }
 
     function validPublicCourse(data) {
@@ -431,7 +1084,9 @@ service cloud.firestore {
           "title", "kind", "description", "url", "createdAt", "createdByUid", "createdByName"
         ])
         && data.keys().hasOnly([
-          "title", "kind", "description", "url", "createdAt", "createdByUid", "createdByName"
+          "title", "kind", "description", "url", "createdAt", "createdByUid", "createdByName",
+          "driveFileId", "driveFileName", "driveMimeType", "driveSizeBytes",
+          "driveUploadedByUid", "driveUploadedAt", "updatedAt", "updatedByUid"
         ])
         && data.title is string
         && data.title.size() >= 1
@@ -441,12 +1096,83 @@ service cloud.firestore {
         && data.description.size() <= 1200
         && data.url is string
         && data.url.size() <= 1500
-        && data.url.matches("^https://(drive[.]google[.]com|docs[.]google[.]com)/[^\\s]+$")
+        && (data.url.matches("^https://(drive[.]google[.]com|docs[.]google[.]com)/[^\\s]+$")
+          || (data.url == "" && data.get("driveFileId", "") is string && data.get("driveFileId", "") != ""))
+        && validDriveMetadata(data)
         && data.createdAt is timestamp
         && data.createdAt == request.time
         && data.createdByUid == request.auth.uid
         && data.createdByName is string
         && data.createdByName.size() <= 80;
+    }
+
+    function validRoleResource(data) {
+      return data.keys().hasAll([
+          "targetRole", "title", "description", "url", "kind", "active",
+          "createdByUid", "createdAt", "updatedByUid", "updatedAt"
+        ])
+        && data.keys().hasOnly([
+          "targetRole", "title", "description", "url", "kind", "active",
+          "createdByUid", "createdAt", "updatedByUid", "updatedAt",
+          "driveFileId", "driveFileName", "driveMimeType", "driveSizeBytes",
+          "driveUploadedByUid", "driveUploadedAt"
+        ])
+        && data.targetRole in ["user", "leaders", "public", "tech", "social", "designers", "content", "event"]
+        && data.title is string
+        && data.title.size() >= 1
+        && data.title.size() <= 120
+        && data.description is string
+        && data.description.size() <= 600
+        && data.url is string
+        && data.url.size() <= 1500
+        && (data.url.matches("^https://[^\\s]+$")
+          || (data.url == "" && data.get("driveFileId", "") is string && data.get("driveFileId", "") != ""))
+        && validDriveMetadata(data)
+        && data.kind in ["link", "video", "book", "document", "tool", "inspiration"]
+        && data.active is bool
+        && data.createdByUid is string
+        && data.createdAt is timestamp
+        && data.updatedByUid == request.auth.uid
+        && data.updatedAt == request.time;
+    }
+
+    function validDriveMetadata(data) {
+      return !data.keys().hasAny(["driveFileId"])
+        || (data.driveFileId is string
+          && data.driveFileId.size() <= 200
+          && (data.driveFileId == ""
+            ? data.get("driveFileName", "") == ""
+              && data.get("driveMimeType", "") == ""
+              && data.get("driveSizeBytes", 0) == 0
+              && data.get("driveUploadedByUid", "") == ""
+              && data.get("driveUploadedAt", "") == ""
+            : data.keys().hasAll([
+                "driveFileName", "driveMimeType", "driveSizeBytes", "driveUploadedByUid", "driveUploadedAt"
+              ])
+              && data.driveFileName is string && data.driveFileName.size() <= 160
+              && data.driveMimeType is string && data.driveMimeType.size() <= 120
+              && data.driveSizeBytes is int && data.driveSizeBytes >= 0 && data.driveSizeBytes <= 52428800
+              && data.driveUploadedByUid is string && data.driveUploadedByUid.size() <= 128
+              && data.driveUploadedAt is string && data.driveUploadedAt.size() <= 40));
+    }
+
+    function validProfileDrivePhoto(data, uid) {
+      return data.get("photoDriveFileId", "") is string
+        && data.get("photoDriveFileId", "").size() <= 200
+        && (data.get("photoDriveFileId", "") == ""
+          ? data.get("photoFileName", "") == ""
+            && data.get("photoMimeType", "") == ""
+            && data.get("photoSizeBytes", 0) == 0
+            && data.get("photoUploadedByUid", "") == ""
+            && data.get("photoUploadedAt", "") == ""
+          : data.get("photoFileName", "") is string
+            && data.get("photoFileName", "").size() <= 160
+            && data.get("photoMimeType", "") in ["image/jpeg", "image/png", "image/webp"]
+            && data.get("photoSizeBytes", 0) is int
+            && data.get("photoSizeBytes", 0) > 0
+            && data.get("photoSizeBytes", 0) <= 10485760
+            && data.get("photoUploadedByUid", "") == uid
+            && data.get("photoUploadedAt", null) is timestamp);
     }
 
     match /courses/{courseId} {
@@ -488,10 +1214,7 @@ service cloud.firestore {
           && data.scopeTarget is string
           && data.scopeTarget.size() >= 1
           && data.scopeTarget.size() <= 128
-          && data.capability in [
-            "formsManage", "formsRead", "formsResponses", "coursesManage", "coursesRead",
-            "technicalMaterialsManage", "technicalMaterialsRead", "designerResourcesRead"
-          ]
+          && validDashboardCapability(data.capability)
           && data.active == true
           && data.updatedByUid == request.auth.uid
           && data.updatedAt == request.time
@@ -507,6 +1230,11 @@ service cloud.firestore {
       }
 
       allow get: if roleIs("admin") || canGetCurrentMemberDashboardGrant(grantId)
+        || (member() && resource.data.active == true
+          && ((resource.data.scopeType == "user" && resource.data.scopeTarget == request.auth.uid)
+            || (resource.data.scopeType == "role" && resource.data.scopeTarget == memberRole())
+            || (resource.data.scopeType == "university"
+              && resource.data.scopeTarget == get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get("universityTag", ""))))
         || (hasDashboardAccess("technicalMaterialsManage")
           && resource.data.capability in ["technicalMaterialsRead", "technicalMaterialsManage"]);
       allow list: if roleIs("admin")
@@ -524,11 +1252,48 @@ service cloud.firestore {
       allow delete: if roleIs("admin");
     }
 
+    match /roleResources/{resourceId} {
+      allow read: if canReadRoleResources(resource.data.get("targetRole", ""));
+      allow create: if canManageRoleResources(request.resource.data.get("targetRole", ""))
+        && validRoleResource(request.resource.data)
+        && request.resource.data.createdByUid == request.auth.uid
+        && request.resource.data.createdAt == request.time;
+      allow update: if canManageRoleResources(resource.data.get("targetRole", ""))
+        && canManageRoleResources(request.resource.data.get("targetRole", ""))
+        && validRoleResource(request.resource.data)
+        && request.resource.data.createdByUid == resource.data.get("createdByUid", "")
+        && request.resource.data.createdAt == resource.data.get("createdAt", null);
+      allow delete: if canManageRoleResources(resource.data.get("targetRole", ""));
+    }
+
     match /technicalMaterials/{materialId} {
-      allow read: if roleIs("admin") || roleIs("tech") || hasDashboardAccess("technicalMaterialsRead") || hasDashboardAccess("technicalMaterialsManage");
-      allow create: if (roleIs("admin") || hasDashboardAccess("technicalMaterialsManage")) && validTechnicalMaterial(request.resource.data);
-      allow update: if false;
-      allow delete: if roleIs("admin") || hasDashboardAccess("technicalMaterialsManage");
+      allow read: if roleIs("admin") || roleIs("tech") || leadsTeamRole("tech")
+        || hasDashboardAccess("technicalMaterialsRead") || hasDashboardAccess("technicalMaterialsManage");
+      allow create: if (roleIs("admin") || leadsTeamRole("tech") || hasDashboardAccess("technicalMaterialsManage"))
+        && validTechnicalMaterial(request.resource.data);
+      allow update: if (roleIs("admin") || leadsTeamRole("tech") || hasDashboardAccess("technicalMaterialsManage"))
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "title", "kind", "description", "url", "driveFileId", "driveFileName", "driveMimeType",
+          "driveSizeBytes", "driveUploadedByUid", "driveUploadedAt", "updatedAt", "updatedByUid"
+        ])
+        && request.resource.data.title is string
+        && request.resource.data.title.size() >= 1
+        && request.resource.data.title.size() <= 120
+        && request.resource.data.kind in ["video", "lecture", "book", "material"]
+        && request.resource.data.description is string
+        && request.resource.data.description.size() <= 1200
+        && request.resource.data.url is string
+        && request.resource.data.url.size() <= 1500
+        && (request.resource.data.url.matches("^https://(drive[.]google[.]com|docs[.]google[.]com)/[^\\s]+$")
+          || (request.resource.data.url == "" && request.resource.data.get("driveFileId", "") is string
+            && request.resource.data.get("driveFileId", "") != ""))
+        && validDriveMetadata(request.resource.data)
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.createdByUid == resource.data.createdByUid
+        && request.resource.data.createdByName == resource.data.createdByName
+        && request.resource.data.updatedByUid == request.auth.uid
+        && request.resource.data.updatedAt == request.time;
+      allow delete: if roleIs("admin") || leadsTeamRole("tech") || hasDashboardAccess("technicalMaterialsManage");
     }
 
     match /forms/{formId} {
@@ -554,11 +1319,50 @@ service cloud.firestore {
       allow create, update: if false;
     }
 
-    // NawrasOnline rooms are visible only to active members in the selected
-    // audience. Admins and leaders can create sessions and moderate them.
+    match /academyCalendarEvents/{eventId} {
+      function validAcademyEvent(data) {
+        return data.keys().hasAll([
+            "title", "description", "audienceRole", "startsAt", "endsAt",
+            "createdBy", "createdAt", "updatedBy", "updatedAt"
+          ])
+          && data.keys().hasOnly([
+            "title", "description", "audienceRole", "startsAt", "endsAt",
+            "createdBy", "createdAt", "updatedBy", "updatedAt"
+          ])
+          && data.title is string && data.title.size() >= 1 && data.title.size() <= 120
+          && data.description is string && data.description.size() <= 2000
+          && data.audienceRole in [
+            "all", "admin", "user", "leaders", "public", "tech", "social", "designers", "content", "event"
+          ]
+          && data.startsAt is timestamp
+          && data.endsAt is timestamp && data.endsAt > data.startsAt
+          && data.createdBy is string && data.createdBy.size() > 0
+          && data.createdAt is timestamp
+          && data.updatedBy is string && data.updatedBy.size() > 0
+          && data.updatedAt == request.time;
+      }
+
+      allow read: if member()
+        && (roleIs("admin")
+          || resource.data.get("audienceRole", "") == "all"
+          || resource.data.get("audienceRole", "") == memberRole());
+      allow create: if roleIs("admin")
+        && validAcademyEvent(request.resource.data)
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedBy == request.auth.uid;
+      allow update: if roleIs("admin")
+        && validAcademyEvent(request.resource.data)
+        && request.resource.data.createdBy == resource.data.createdBy
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.updatedBy == request.auth.uid;
+      allow delete: if roleIs("admin");
+    }
+
+    // Role-specific rooms are private to active members of that role.
     match /nawrasOnlineSessions/{sessionId} {
       allow read: if canAccessOnlineSession(resource.data);
-      allow create: if sessionManager()
+      allow create: if canManageOnlineSession(request.resource.data)
         && request.resource.data.keys().hasAll([
           "title", "description", "audienceRole", "startsAt", "createdBy",
           "createdByName", "audienceUniversityTag", "status", "createdAt", "updatedAt"
@@ -570,8 +1374,10 @@ service cloud.firestore {
         ])
         && request.resource.data.get("targetMemberUids", []) is list
         && request.resource.data.get("targetMemberUids", []).size() <= 100
-        && (request.resource.data.audienceRole != "targeted"
-          || request.resource.data.get("targetMemberUids", []).size() > 0)
+        && ((request.resource.data.audienceRole == "targeted"
+            && request.resource.data.get("targetMemberUids", []).size() > 0)
+          || (request.resource.data.audienceRole != "targeted"
+            && request.resource.data.get("targetMemberUids", []).size() == 0))
         && (!request.resource.data.keys().hasAny(["endsAt"])
           || (request.resource.data.endsAt is timestamp
             && request.resource.data.endsAt > request.resource.data.startsAt
@@ -591,8 +1397,8 @@ service cloud.firestore {
         && request.resource.data.status == "scheduled"
         && request.resource.data.createdAt == request.time
         && request.resource.data.updatedAt == request.time;
-      allow update: if (
-          sessionManager()
+      allow update: if canMigrateLegacyTaskAudience() || (
+          canManageOnlineSession(resource.data)
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["status", "updatedAt", "endedAt", "expiresAt"])
           && request.resource.data.updatedAt == request.time
           && (
@@ -638,13 +1444,13 @@ service cloud.firestore {
       }
 
       // Original room visits are append-only until an admin deletes an ended room. A member may open their own visit
-      // and close it once; only admins can inspect the resulting attendance log.
+      // and close it once; attendance readers may inspect only accessible rooms.
       match /attendanceVisits/{visitId} {
         function parentSession() {
           return get(/databases/$(database)/documents/nawrasOnlineSessions/$(sessionId)).data;
         }
 
-        allow read: if roleIs("admin");
+        allow read: if attendanceReader() && canAccessOnlineSession(parentSession());
         allow create: if canAccessOnlineSession(parentSession())
           && parentSession().status in ["scheduled", "live"]
           && request.resource.data.keys().hasAll([
@@ -676,6 +1482,9 @@ service cloud.firestore {
 
       // Admin overrides and notes are kept separate from immutable visit logs.
       match /attendance/{uid} {
+        function parentSession() {
+          return get(/databases/$(database)/documents/nawrasOnlineSessions/$(sessionId)).data;
+        }
         function validAttendanceOverride(data) {
           return data.keys().hasAll([
               "uid", "statusOverride", "notes", "updatedBy", "updatedAt"
@@ -690,11 +1499,13 @@ service cloud.firestore {
             && data.updatedAt == request.time;
         }
 
-        allow read: if roleIs("admin");
-        allow create: if roleIs("admin")
+        allow read: if attendanceReader() && canAccessOnlineSession(parentSession());
+        allow create: if attendanceManager()
+          && canAccessOnlineSession(parentSession())
           && uid == request.resource.data.uid
           && validAttendanceOverride(request.resource.data);
-        allow update: if roleIs("admin")
+        allow update: if attendanceManager()
+          && canAccessOnlineSession(parentSession())
           && uid == resource.data.uid
           && uid == request.resource.data.uid
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
@@ -719,6 +1530,7 @@ service cloud.firestore {
         && request.resource.data.createdAt == request.time;
       allow read: if resource.data.status == "answered"
         || (signedIn() && resource.data.ownerUid == request.auth.uid)
+        || hasDashboardAccess("questionsRead")
         || canAnswerQuestion(resource.data.targetRole);
       allow update: if canAnswerQuestion(resource.data.targetRole)
         && resource.data.status == "open"
@@ -738,23 +1550,256 @@ service cloud.firestore {
         && request.resource.data.answer.size() >= 8
         && request.resource.data.answer.size() <= 1500
         && validLinkEntries(request.resource.data);
+      allow delete: if hasDashboardAccess("questionsManage");
+    }
+
+    match /founderQuestions/{requestId} {
+      function validFounderRole(role) {
+        return role in ["admin", "user", "leaders", "public", "tech", "social", "designers", "content", "event"];
+      }
+
+      allow create: if member()
+        && request.resource.data.keys().hasAll(["question", "ownerUid", "ownerName", "ownerRole", "status", "createdAt"])
+        && request.resource.data.keys().hasOnly(["question", "questionLinks", "ownerUid", "ownerName", "ownerRole", "status", "createdAt"])
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.ownerRole == get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get("role", "")
+        && validFounderRole(request.resource.data.ownerRole)
+        && request.resource.data.ownerName is string
+        && request.resource.data.ownerName.size() >= 1
+        && request.resource.data.ownerName.size() <= 80
+        && request.resource.data.question is string
+        && request.resource.data.question.size() >= 8
+        && request.resource.data.question.size() <= 1500
+        && request.resource.data.status == "open"
+        && validFounderLinks(request.resource.data.get("questionLinks", []))
+        && request.resource.data.createdAt == request.time;
+      allow read: if roleIs("admin")
+        || (member() && resource.data.ownerUid == request.auth.uid);
+      allow update: if roleIs("admin")
+        && resource.data.status == "open"
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "status", "answer", "answerLinks", "answeredByUid", "answeredByName", "answeredAt"
+        ])
+        && request.resource.data.ownerUid == resource.data.ownerUid
+        && request.resource.data.ownerRole == resource.data.ownerRole
+        && request.resource.data.ownerName == resource.data.ownerName
+        && request.resource.data.question == resource.data.question
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.status == "answered"
+        && request.resource.data.answer is string
+        && request.resource.data.answer.size() >= 8
+        && request.resource.data.answer.size() <= 1500
+        && validFounderLinks(request.resource.data.get("answerLinks", []))
+        && request.resource.data.answeredByUid == request.auth.uid
+        && request.resource.data.answeredByName is string
+        && request.resource.data.answeredByName.size() >= 1
+        && request.resource.data.answeredByName.size() <= 80
+        && request.resource.data.answeredAt == request.time;
       allow delete: if roleIs("admin");
+    }
+
+    match /crossTeamWorkflows/{workflowId} {
+      function validAdminWorkflowUpdate() {
+        return roleIs("admin")
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "status", "currentStageIndex", "stageIds", "stageRoles", "participantRoles",
+            "participantUids", "deadline", "cancelReason", "progress", "updatedAt", "lastActivityAt"
+          ])
+          && request.resource.data.updatedAt == request.time
+          && request.resource.data.lastActivityAt == request.time
+          && request.resource.data.status in ["active", "paused", "completed", "cancelled"]
+          && request.resource.data.stageIds is list
+          && request.resource.data.stageIds.size() >= 2
+          && request.resource.data.stageIds.size() <= 6
+          && request.resource.data.stageRoles is list
+          && request.resource.data.stageRoles.size() == request.resource.data.stageIds.size()
+          && request.resource.data.stageRoles.hasOnly(["user", "leaders", "public", "tech", "social", "designers", "content", "event"])
+          && request.resource.data.participantRoles is list
+          && request.resource.data.participantRoles.hasAll(request.resource.data.stageRoles)
+          && request.resource.data.participantRoles.hasOnly(request.resource.data.stageRoles)
+          && request.resource.data.participantUids is list
+          && request.resource.data.participantUids.size() <= 160
+          && request.resource.data.currentStageIndex is int
+          && request.resource.data.currentStageIndex >= 0
+          && request.resource.data.currentStageIndex < request.resource.data.stageIds.size()
+          && request.resource.data.progress is int
+          && request.resource.data.progress >= 0
+          && request.resource.data.progress <= 100
+          && (request.resource.data.deadline == null || request.resource.data.deadline is timestamp)
+          && (request.resource.data.status != "cancelled"
+            || (request.resource.data.cancelReason is string
+              && request.resource.data.cancelReason.size() >= 3
+              && request.resource.data.cancelReason.size() <= 500))
+          && validWorkflowStageLayout(workflowId, request.resource.data)
+          && (
+            (request.resource.data.status == resource.data.status
+              && request.resource.data.currentStageIndex == resource.data.currentStageIndex)
+            || (resource.data.status == "active"
+              && request.resource.data.status in ["paused", "cancelled"]
+              && request.resource.data.currentStageIndex == resource.data.currentStageIndex)
+            || (resource.data.status == "paused"
+              && request.resource.data.status in ["active", "cancelled"]
+              && request.resource.data.currentStageIndex == resource.data.currentStageIndex)
+            || workflowReviewHandoverValid(workflowId, resource.data, request.resource.data)
+            || workflowDirectHandoverValid(workflowId, resource.data, request.resource.data)
+          );
+      }
+
+      allow read: if canReadCrossTeamWorkflow(resource.data);
+      allow create: if canCreateCrossTeamWorkflow()
+        && request.resource.data.id == workflowId
+        && request.resource.data.createdByUid == request.auth.uid
+        && request.resource.data.createdByRole == memberRole()
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.status == "active"
+        && request.resource.data.currentStageIndex == 0
+        && request.resource.data.progress == 0
+        && validCrossTeamRoot(request.resource.data)
+        && validWorkflowStageLayout(workflowId, request.resource.data);
+      allow update: if roleIs("admin") ? validAdminWorkflowUpdate() : (member()
+          && canWorkCurrentWorkflowStage(resource.data,
+            get(crossTeamStagePath(workflowId, resource.data.stageIds[resource.data.currentStageIndex])).data)
+          && (workflowDirectHandoverValid(workflowId, resource.data, request.resource.data)
+            || workflowActivityTouchValid(workflowId, resource.data, request.resource.data)));
+      allow delete: if false;
+
+      match /stages/{stageId} {
+        function stageWorkflow() {
+          return get(crossTeamWorkflowPath(workflowId)).data;
+        }
+
+        function validStageCreation() {
+          let workflow = getAfter(crossTeamWorkflowPath(workflowId)).data;
+          let stage = request.resource.data;
+          return member()
+            && validCrossTeamStage(stage)
+            && stage.workflowId == workflowId
+            && stage.stageId == stageId
+            && workflow.stageIds[stage.stageIndex] == stageId
+            && workflow.stageRoles[stage.stageIndex] == stage.teamRole
+            && (
+              (workflow.createdByUid == request.auth.uid
+                && workflow.createdAt == request.time
+                && stage.status == (stage.stageIndex == 0 ? "in_progress" : "pending"))
+              || (roleIs("admin") && stage.status == "pending")
+            );
+        }
+
+        function validAdminStageReorder() {
+          let workflow = getAfter(crossTeamWorkflowPath(workflowId)).data;
+          let stage = request.resource.data;
+          return stage.diff(resource.data).affectedKeys().hasOnly(["stageIndex", "updatedAt"])
+            && stage.updatedAt == request.time
+            && stage.stageIndex is int
+            && stage.stageIndex >= 0
+            && stage.stageIndex < workflow.stageIds.size()
+            && workflow.stageIds[stage.stageIndex] == stageId
+            && workflow.stageRoles[stage.stageIndex] == stage.teamRole;
+        }
+
+        allow read: if canReadCrossTeamWorkflow(stageWorkflow());
+        allow create: if validStageCreation();
+        allow update: if roleIs("admin")
+          ? (validAdminStageReorder() || workflowAdminStageUpdate())
+          : (workflowNextStageActivation(stageWorkflow())
+            || workflowMemberStageUpdate(stageWorkflow()));
+        allow delete: if roleIs("admin")
+          && resource.data.status == "pending"
+          && resource.data.stageIndex > stageWorkflow().get("currentStageIndex", -1);
+
+        match /comments/{commentId} {
+          function parentWorkflow() {
+            return get(crossTeamWorkflowPath(workflowId)).data;
+          }
+          function parentStage() {
+            return get(crossTeamStagePath(workflowId, stageId)).data;
+          }
+
+          allow read: if canReadCrossTeamWorkflow(parentWorkflow());
+          allow create: if member()
+            && canWorkCurrentWorkflowStage(parentWorkflow(), parentStage())
+            && request.resource.data.keys().hasAll(["actorUid", "actorName", "actorRole", "text", "createdAt"])
+            && request.resource.data.keys().hasOnly(["actorUid", "actorName", "actorRole", "text", "createdAt"])
+            && request.resource.data.actorUid == request.auth.uid
+            && request.resource.data.actorRole == memberRole()
+            && request.resource.data.actorName is string
+            && request.resource.data.actorName.size() >= 1
+            && request.resource.data.actorName.size() <= 80
+            && request.resource.data.text is string
+            && request.resource.data.text.size() >= 2
+            && request.resource.data.text.size() <= 1000
+            && request.resource.data.createdAt == request.time;
+          allow update, delete: if false;
+        }
+      }
+
+      match /activity/{activityId} {
+        function parentWorkflow() {
+          return get(crossTeamWorkflowPath(workflowId)).data;
+        }
+
+        function afterWorkflow() {
+          return getAfter(crossTeamWorkflowPath(workflowId)).data;
+        }
+
+        allow read: if canReadCrossTeamWorkflow(parentWorkflow());
+        allow create: if member()
+          && request.resource.data.keys().hasAll([
+            "action", "detail", "stageId", "stageRole", "actorUid", "actorName", "actorRole", "createdAt"
+          ])
+          && request.resource.data.keys().hasOnly([
+            "action", "detail", "stageId", "stageRole", "actorUid", "actorName", "actorRole", "createdAt"
+          ])
+          && request.resource.data.action is string
+          && request.resource.data.action.size() >= 3
+          && request.resource.data.action.size() <= 100
+          && request.resource.data.detail is string
+          && request.resource.data.detail.size() <= 500
+          && request.resource.data.stageId is string
+          && request.resource.data.stageRole is string
+          && (request.resource.data.stageRole == "" || validWorkflowRole(request.resource.data.stageRole))
+          && request.resource.data.actorUid == request.auth.uid
+          && request.resource.data.actorRole == memberRole()
+          && request.resource.data.actorName is string
+          && request.resource.data.actorName.size() >= 1
+          && request.resource.data.actorName.size() <= 80
+          && request.resource.data.createdAt == request.time
+          && (
+            roleIs("admin")
+            || (afterWorkflow().createdByUid == request.auth.uid
+              && afterWorkflow().createdAt == request.time)
+            || (request.resource.data.stageId != ""
+              && existsAfter(crossTeamStagePath(workflowId, request.resource.data.stageId))
+               && canLogWorkflowStageActivity(afterWorkflow(),
+                getAfter(crossTeamStagePath(workflowId, request.resource.data.stageId)).data))
+          );
+        allow update, delete: if false;
+      }
     }
 
     match /tasks/{taskId} {
       allow read: if canReadTask(resource.data);
-      allow create: if roleIs("admin")
+      allow create: if validTaskCreatorScope(request.resource.data)
+        && validTaskAudience(request.resource.data)
         && request.resource.data.keys().hasAll([
-          "title", "description", "targetRole", "mode", "xp", "status",
+          "title", "description", "targetRole", "targetUniversityTag",
+          "assignedMemberUids", "audienceMode", "mode", "xp", "status",
           "submissionCount", "claimedByUid", "createdBy", "createdAt", "updatedAt"
         ])
         && request.resource.data.keys().hasOnly([
-          "title", "description", "targetRole", "mode", "xp", "status",
+          "title", "description", "targetRole", "targetUniversityTag",
+          "assignedMemberUids", "audienceMode", "mode", "xp", "status",
           "submissionCount", "claimedByUid", "createdBy", "createdAt", "updatedAt",
-          "assets", "gameType", "gameUrl", "gameHtml"
+          "assets", "gameType", "gameUrl", "gameHtml", "dueAt",
+          "imageUrl", "coverDriveFileId", "coverDriveFileName", "coverDriveMimeType",
+          "coverDriveSizeBytes", "coverDriveUploadedByUid", "coverDriveUploadedAt",
+          "createdByName", "createdByPhotoURL"
         ])
+        && validTaskDeadline(request.resource.data)
         && validTaskAssets(request.resource.data)
         && validTaskGame(request.resource.data)
+        && validTaskCover(request.resource.data)
+        && validTaskCreatorDisplay(request.resource.data)
         && request.resource.data.title is string
         && request.resource.data.title.size() >= 3
         && request.resource.data.title.size() <= 120
@@ -769,15 +1814,39 @@ service cloud.firestore {
         && request.resource.data.status == "open"
         && request.resource.data.submissionCount == 0
         && request.resource.data.claimedByUid == ""
-        && request.resource.data.createdBy == request.auth.uid;
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time;
       allow update: if (
-          roleIs("admin")
-          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-            "title", "description", "targetRole", "mode", "xp", "status", "updatedAt",
-            "assets", "gameType", "gameUrl", "gameHtml"
+          request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            "targetUniversityTag", "assignedMemberUids", "audienceMode"
           ])
+          && canMigrateLegacyTaskAudience()
+        ) || (
+          canManageTask(resource.data)
+          && validTaskCreatorScope(request.resource.data)
+          && validTaskAudience(request.resource.data)
+          && (hasDashboardAccess("tasksManage") || request.resource.data.targetRole == resource.data.targetRole)
+          && ((request.resource.data.targetRole == resource.data.targetRole
+              && request.resource.data.targetUniversityTag == resource.data.get("targetUniversityTag", "")
+              && request.resource.data.assignedMemberUids == resource.data.get("assignedMemberUids", [])
+              && request.resource.data.audienceMode == resource.data.get("audienceMode", "all")
+              && request.resource.data.mode == resource.data.mode)
+            || (hasDashboardAccess("tasksManage")
+              && resource.data.get("submissionCount", 0) == 0
+              && resource.data.status == "open"
+              && resource.data.get("claimedByUid", "") == ""))
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "title", "description", "targetRole", "targetUniversityTag",
+            "assignedMemberUids", "audienceMode", "mode", "xp", "status", "claimedByUid", "updatedAt",
+            "assets", "gameType", "gameUrl", "gameHtml", "dueAt",
+            "imageUrl", "coverDriveFileId", "coverDriveFileName", "coverDriveMimeType",
+            "coverDriveSizeBytes", "coverDriveUploadedByUid", "coverDriveUploadedAt"
+          ])
+          && validTaskDeadline(request.resource.data)
           && validTaskAssets(request.resource.data)
           && validTaskGame(request.resource.data)
+          && validTaskCover(request.resource.data)
           && request.resource.data.title is string
           && request.resource.data.title.size() >= 3
           && request.resource.data.title.size() <= 120
@@ -790,6 +1859,9 @@ service cloud.firestore {
           && request.resource.data.xp >= 1
           && request.resource.data.xp <= 100000
           && (request.resource.data.status == "open" || request.resource.data.status == "closed" || request.resource.data.status == "claimed")
+          && request.resource.data.createdBy == resource.data.createdBy
+          && request.resource.data.createdAt == resource.data.createdAt
+          && request.resource.data.updatedAt == request.time
         ) || (
           canSubmitTask(resource.data)
           && resource.data.status == "open"
@@ -803,10 +1875,11 @@ service cloud.firestore {
            && request.resource.data.claimedByUid == resource.data.claimedByUid
            && request.resource.data.status == resource.data.status
         );
-      allow delete: if roleIs("admin");
+      allow delete: if canManageTask(resource.data);
 
       match /submissions/{uid} {
         allow read: if roleIs("admin")
+          || canManageTask(get(/databases/$(database)/documents/tasks/$(taskId)).data)
           || (member() && uid == request.auth.uid && canSubmitTask(get(/databases/$(database)/documents/tasks/$(taskId)).data));
         allow create: if member()
           && uid == request.auth.uid
@@ -836,7 +1909,22 @@ service cloud.firestore {
           && validLinkEntries(request.resource.data)
            && request.resource.data.xpAwarded == 0
            && request.resource.data.status == "pending";
-        allow update, delete: if roleIs("admin");
+        allow update: if canManageTask(get(/databases/$(database)/documents/tasks/$(taskId)).data)
+          && (roleIs("admin") || uid != request.auth.uid)
+          && resource.data.taskId == taskId
+          && resource.data.submitterUid == uid
+          && resource.data.get("status", "pending") == "pending"
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "status", "xpAwarded", "reviewedByUid", "reviewedAt"
+          ])
+          && request.resource.data.status in ["approved", "rejected"]
+          && request.resource.data.xpAwarded is int
+          && request.resource.data.xpAwarded >= 0
+          && request.resource.data.xpAwarded <= get(/databases/$(database)/documents/tasks/$(taskId)).data.get("xp", 0)
+          && (request.resource.data.status != "rejected" || request.resource.data.xpAwarded == 0)
+          && request.resource.data.reviewedByUid == request.auth.uid
+          && request.resource.data.reviewedAt == request.time;
+        allow delete: if canManageTask(get(/databases/$(database)/documents/tasks/$(taskId)).data);
       }
     }
 
@@ -844,6 +1932,7 @@ service cloud.firestore {
       allow read: if signedIn()
         && (request.auth.uid == uid
           || roleIs("admin")
+          || hasDashboardAccess("ratingsRead")
           || (roleIs("leaders")
             && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true
             && get(/databases/$(database)/documents/teamMembers/$(uid)).data.role != "admin"
@@ -855,7 +1944,9 @@ service cloud.firestore {
             && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true
             && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "") != "admin"
             && leadsTeamRole(get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", ""))));
-      allow create, update: if canManageTeamMember(uid)
+      allow create, update: if (canRateMember(uid)
+          || (canResetMember(uid, "ratingsReset")
+            && request.resource.data.scores == {} && request.resource.data.notes == {}))
         && request.resource.data.keys().hasAll(["scores", "notes", "universityTag", "active", "updatedByUid", "updatedAt"])
         && request.resource.data.keys().hasOnly(["scores", "notes", "universityTag", "active", "updatedByUid", "updatedAt"])
         && validRatingScores(request.resource.data.scores)
@@ -876,6 +1967,7 @@ service cloud.firestore {
         || roleIs("admin");
       allow create: if signedIn()
         && request.auth.uid == uid
+        && !exists(/databases/$(database)/documents/deletedAccounts/$(uid))
         && request.resource.data.keys().hasAll([
           "uid", "displayName", "photoURL", "bio", "socialLinks", "role", "active",
           "dashboardRoles", "universityTag", "leadingUniversityTag", "xp", "level",
@@ -884,6 +1976,7 @@ service cloud.firestore {
         && request.resource.data.keys().hasOnly([
           "uid", "displayName", "photoURL", "bio", "socialLinks", "role", "active",
           "dashboardRoles", "universityTag", "leadingUniversityTag", "xp", "level",
+          "photoDriveFileId", "photoFileName", "photoMimeType", "photoSizeBytes", "photoUploadedByUid", "photoUploadedAt",
           "answersCount", "tasksCompleted", "createdAt", "updatedAt"
         ])
         && request.resource.data.uid == uid
@@ -939,6 +2032,14 @@ service cloud.firestore {
               && request.resource.data.role == "admin"
               && validAdminTeamAssignment(request.resource.data.adminTeamAssignment)))
         ) || (
+          roleIs("admin")
+          && uid != request.auth.uid
+          && resource.data.role != "admin"
+          && request.resource.data.role == resource.data.role
+          && request.resource.data.active is bool
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["active", "updatedAt"])
+          && request.resource.data.updatedAt == request.time
+        ) || (
           member()
           && request.auth.uid == uid
           && resource.data.role != "admin"
@@ -956,11 +2057,12 @@ service cloud.firestore {
           && request.resource.data.lastAnsweredQuestionId is string
           && request.resource.data.lastAnsweredQuestionId != resource.data.get("lastAnsweredQuestionId", "")
           && get(/databases/$(database)/documents/questions/$(request.resource.data.lastAnsweredQuestionId)).data.status == "open"
-          && get(/databases/$(database)/documents/questions/$(request.resource.data.lastAnsweredQuestionId)).data.targetRole == resource.data.role
+          && canAnswerQuestion(get(/databases/$(database)/documents/questions/$(request.resource.data.lastAnsweredQuestionId)).data.targetRole)
           && getAfter(/databases/$(database)/documents/questions/$(request.resource.data.lastAnsweredQuestionId)).data.status == "answered"
           && getAfter(/databases/$(database)/documents/questions/$(request.resource.data.lastAnsweredQuestionId)).data.answeredByUid == request.auth.uid
         ) || (
-          canManageTeamMember(uid)
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(["xp", "level", "updatedAt"])
+          && canAdjustMemberXp(uid)
           && request.auth.uid != uid
           && resource.data.active == true
           && resource.data.role != "admin"
@@ -982,32 +2084,55 @@ service cloud.firestore {
           && request.resource.data.role == resource.data.role
           && request.resource.data.active == resource.data.active
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-            "displayName", "photoURL", "bio", "socialLinks", "updatedAt"
+             "displayName", "photoURL", "bio", "socialLinks", "updatedAt",
+             "photoDriveFileId", "photoFileName", "photoMimeType", "photoSizeBytes", "photoUploadedByUid", "photoUploadedAt",
+             "publicProfileArt", "publicProfileStickers"
           ])
-          && validSocialLinks(request.resource.data.get("socialLinks", {}))
+          && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(["socialLinks"])
+            || validSocialLinks(request.resource.data.get("socialLinks", {})))
+          && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(["publicProfileArt"])
+            || validPublicProfileArt(request.resource.data.get("publicProfileArt", [])))
+          && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(["publicProfileStickers"])
+            || validPublicProfileStickers(request.resource.data.get("publicProfileStickers", [])))
+          && (!request.resource.data.diff(resource.data).affectedKeys().hasAny([
+              "photoDriveFileId", "photoFileName", "photoMimeType", "photoSizeBytes",
+              "photoUploadedByUid", "photoUploadedAt"
+            ]) || validProfileDrivePhoto(request.resource.data, uid))
           // Some older member records predate XP/stats; default missing fields
           // to their original zero values so profile edits do not get denied.
           && request.resource.data.get("xp", 0) == resource.data.get("xp", 0)
           && request.resource.data.get("level", 1) == resource.data.get("level", 1)
           && request.resource.data.get("answersCount", 0) == resource.data.get("answersCount", 0)
-          && request.resource.data.get("displayName", "") is string
-          && request.resource.data.get("displayName", "").size() >= 2
-          && request.resource.data.get("displayName", "").size() <= 80
-          && request.resource.data.get("photoURL", "") is string
-          && request.resource.data.get("photoURL", "").size() <= 1000
-          && request.resource.data.get("bio", "") is string
-          && request.resource.data.get("bio", "").size() <= 240
-        );
+          && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(["displayName"])
+            || (request.resource.data.get("displayName", "") is string
+              && request.resource.data.get("displayName", "").size() >= 2
+              && request.resource.data.get("displayName", "").size() <= 80))
+          && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(["photoURL"])
+            || (request.resource.data.get("photoURL", "") is string
+              && request.resource.data.get("photoURL", "").size() <= 1000))
+          && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(["bio"])
+            || (request.resource.data.get("bio", "") is string
+              && request.resource.data.get("bio", "").size() <= 240))
+        ) || delegatedAssignmentsAreValid(uid) || validBulkXpReset(uid) || validTaskReviewAward(uid);
       allow create, delete: if false;
 
       match /notificationTokens/{tokenId} {
+        // Push registration is retired. Owners may still remove old tokens.
         allow read, delete: if signedIn() && request.auth.uid == uid;
-        allow create, update: if signedIn()
-          && request.auth.uid == uid
-          && request.resource.data.uid == uid
-          && request.resource.data.token is string
-          && request.resource.data.token.size() >= 20
-          && request.resource.data.token.size() <= 500;
+        allow create, update: if false;
+      }
+
+      match /taskAssignments/{taskId} {
+        function assignmentTask() {
+          return get(/databases/$(database)/documents/tasks/$(taskId)).data;
+        }
+        allow read: if member() && request.auth.uid == uid;
+        allow create, update: if canManageTask(assignmentTask())
+          && taskAudienceMatchesMember(assignmentTask(), uid)
+          && request.resource.data.keys().hasOnly(["taskId", "createdAt"])
+          && request.resource.data.taskId == taskId
+          && request.resource.data.createdAt == request.time;
+        allow delete: if canManageTask(assignmentTask());
       }
 
       match /calendarEvents/{eventId} {
@@ -1043,9 +2168,9 @@ service cloud.firestore {
       }
 
       match /notifications/{notificationId} {
-        allow read: if signedIn() && request.auth.uid == uid;
-        allow delete: if signedIn() && request.auth.uid == uid;
-        allow update: if signedIn()
+        allow read: if member() && request.auth.uid == uid;
+        allow delete: if member() && request.auth.uid == uid;
+        allow update: if member()
           && request.auth.uid == uid
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["read"])
           && request.resource.data.read == true;
@@ -1055,9 +2180,12 @@ service cloud.firestore {
           ])
           && request.resource.data.keys().hasOnly([
             "type", "title", "message", "actorUid", "actorName", "createdAt",
-             "read", "questionId", "taskId", "reviewStatus", "formId", "technicalMaterialId",
+              "read", "questionId", "taskId", "taskRole", "reviewStatus", "formId", "technicalMaterialId",
+              "roleResourceId", "roleResourceRole",
              "courseId", "sessionId", "accessScopeType", "accessScopeTarget", "technicalAccessGrantId", "responseId",
-             "chatId", "chatMessageId"
+              "chatId", "chatMessageId", "eventId", "founderQuestion", "founderAnswer",
+               "founderQuestionLinks", "founderAnswerLinks", "workflowId", "workflowStageId",
+               "workflowRecipientRoles"
           ])
           && request.resource.data.type is string
           && request.resource.data.title is string
@@ -1073,7 +2201,46 @@ service cloud.firestore {
           && request.resource.data.createdAt == request.time
           && request.resource.data.read == false
           && (
-            (request.resource.data.type == "question_answer"
+            (request.resource.data.type == "cross_team_work"
+              && request.resource.data.workflowId is string
+              && request.resource.data.workflowRecipientRoles is list
+              && request.resource.data.workflowRecipientRoles.size() >= 1
+              && request.resource.data.workflowRecipientRoles.size() <= 9
+              && request.resource.data.workflowRecipientRoles.hasOnly([
+                "admin", "user", "leaders", "public", "tech", "social", "designers", "content", "event"
+              ])
+              && workflowRecipientMatches(
+                get(crossTeamWorkflowPath(request.resource.data.workflowId)).data, uid)
+              && (get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "")
+                in request.resource.data.workflowRecipientRoles
+                || get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("teamLeadRoles", [])
+                   .hasAny(request.resource.data.workflowRecipientRoles)
+                || (get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("dashboardRoles", []) is list
+                  && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("dashboardRoles", [])
+                    .hasAny(request.resource.data.workflowRecipientRoles))
+                || get(crossTeamWorkflowPath(request.resource.data.workflowId)).data.get("participantUids", [])
+                  .hasAny([uid])
+                || get(crossTeamWorkflowPath(request.resource.data.workflowId)).data.createdByUid == uid)
+              && canNotifyCrossTeamWorkflow(request.resource.data.workflowId,
+                request.resource.data.get("workflowStageId", "")))
+            || (request.resource.data.type == "founder_answer"
+              && member()
+              && request.resource.data.questionId is string
+              && request.resource.data.founderQuestion is string
+              && request.resource.data.founderQuestion.size() >= 8
+              && request.resource.data.founderQuestion.size() <= 1500
+              && request.resource.data.founderAnswer is string
+              && request.resource.data.founderAnswer.size() >= 8
+              && request.resource.data.founderAnswer.size() <= 1500
+               && validFounderLinks(request.resource.data.get("founderQuestionLinks", []))
+               && validFounderLinks(request.resource.data.get("founderAnswerLinks", []))
+              && notificationId == "founder-answer_" + request.resource.data.questionId
+              && getAfter(/databases/$(database)/documents/founderQuestions/$(request.resource.data.questionId)).data.ownerUid == uid
+              && getAfter(/databases/$(database)/documents/founderQuestions/$(request.resource.data.questionId)).data.status == "answered"
+              && getAfter(/databases/$(database)/documents/founderQuestions/$(request.resource.data.questionId)).data.answeredByUid == request.auth.uid
+              && getAfter(/databases/$(database)/documents/founderQuestions/$(request.resource.data.questionId)).data.question == request.resource.data.founderQuestion
+              && getAfter(/databases/$(database)/documents/founderQuestions/$(request.resource.data.questionId)).data.answer == request.resource.data.founderAnswer)
+            || (request.resource.data.type == "question_answer"
               && request.resource.data.questionId is string
               && getAfter(/databases/$(database)/documents/questions/$(request.resource.data.questionId)).data.status == "answered"
               && getAfter(/databases/$(database)/documents/questions/$(request.resource.data.questionId)).data.ownerUid == uid
@@ -1108,47 +2275,71 @@ service cloud.firestore {
               && getAfter(/databases/$(database)/documents/leaderChats/$(request.resource.data.chatId)/messages/$(request.resource.data.chatMessageId)).data.senderUid == request.auth.uid
               && getAfter(/databases/$(database)/documents/leaderChats/$(request.resource.data.chatId)/messages/$(request.resource.data.chatMessageId)).data.createdAt == request.time)
             || (request.resource.data.type == "attendance_update"
-              && roleIs("admin")
+              && attendanceManager()
               && request.resource.data.sessionId is string
+               && canAccessOnlineSession(get(/databases/$(database)/documents/nawrasOnlineSessions/$(request.resource.data.sessionId)).data)
+               && sessionAudienceMatchesMember(get(/databases/$(database)/documents/nawrasOnlineSessions/$(request.resource.data.sessionId)).data, uid)
               && getAfter(/databases/$(database)/documents/nawrasOnlineSessions/$(request.resource.data.sessionId)/attendance/$(uid)).data.updatedBy == request.auth.uid
               && getAfter(/databases/$(database)/documents/nawrasOnlineSessions/$(request.resource.data.sessionId)/attendance/$(uid)).data.updatedAt == request.time)
             || (request.resource.data.type == "task_review"
-              && roleIs("admin")
               && request.resource.data.taskId is string
+               && canManageTask(
+                 get(/databases/$(database)/documents/tasks/$(request.resource.data.taskId)).data
+              )
+              && request.resource.data.get("taskRole", "") == get(/databases/$(database)/documents/tasks/$(request.resource.data.taskId)).data.get("targetRole", "")
               && request.resource.data.reviewStatus in ["approved", "rejected"]
               && getAfter(/databases/$(database)/documents/tasks/$(request.resource.data.taskId)/submissions/$(uid)).data.status == request.resource.data.reviewStatus
               && getAfter(/databases/$(database)/documents/tasks/$(request.resource.data.taskId)/submissions/$(uid)).data.reviewedByUid == request.auth.uid)
             || (request.resource.data.type == "xp_adjustment"
-              && canManageTeamMember(uid)
+              && canAdjustMemberXp(uid)
               && request.resource.data.message.matches(".*Reason: .{3,}")
               && getAfter(/databases/$(database)/documents/teamMembers/$(uid)).data.diff(
                 get(/databases/$(database)/documents/teamMembers/$(uid)).data
               ).affectedKeys().hasAny(["xp"]))
             || (request.resource.data.type == "xp_reset"
-              && roleIs("admin")
+              && canResetMember(uid, "xpReset")
               && getAfter(/databases/$(database)/documents/teamMembers/$(uid)).data.xp == 0
               && getAfter(/databases/$(database)/documents/teamMembers/$(uid)).data.diff(
                 get(/databases/$(database)/documents/teamMembers/$(uid)).data
               ).affectedKeys().hasAny(["xp", "level"]))
             || (request.resource.data.type == "ratings_update"
-              && canManageTeamMember(uid)
+              && canRateMember(uid)
               && getAfter(/databases/$(database)/documents/memberRatings/$(uid)).data.updatedByUid == request.auth.uid
               && (!exists(/databases/$(database)/documents/memberRatings/$(uid))
                 || getAfter(/databases/$(database)/documents/memberRatings/$(uid)).data.diff(
                   get(/databases/$(database)/documents/memberRatings/$(uid)).data
                 ).affectedKeys().hasAny(["scores", "notes"])))
             || (request.resource.data.type == "ratings_reset"
-              && roleIs("admin")
+              && canResetMember(uid, "ratingsReset")
               && getAfter(/databases/$(database)/documents/memberRatings/$(uid)).data.scores.size() == 0
               && getAfter(/databases/$(database)/documents/memberRatings/$(uid)).data.notes.size() == 0)
             || (request.resource.data.type == "member_assignment"
-              && roleIs("admin")
+              && canAssignMember(uid)
               && getAfter(/databases/$(database)/documents/teamMembers/$(uid)).data.diff(
                 get(/databases/$(database)/documents/teamMembers/$(uid)).data
               ).affectedKeys().hasAny([
                 "role", "dashboardRoles", "universityTag", "leadingUniversityTag",
                 "teamLeadRoles", "adminTeamAssignment"
               ]))
+              || (request.resource.data.type == "role_resource"
+                && request.resource.data.roleResourceId is string
+                && request.resource.data.roleResourceRole in ["user", "leaders", "public", "tech", "social", "designers", "content", "event"]
+                && canManageRoleResources(request.resource.data.roleResourceRole)
+                && exists(/databases/$(database)/documents/roleResources/$(request.resource.data.roleResourceId))
+                && get(/databases/$(database)/documents/roleResources/$(request.resource.data.roleResourceId)).data.get("targetRole", "") == request.resource.data.roleResourceRole
+                && get(/databases/$(database)/documents/roleResources/$(request.resource.data.roleResourceId)).data.get("active", false) == true
+                && get(/databases/$(database)/documents/roleResources/$(request.resource.data.roleResourceId)).data.get("updatedByUid", "") == request.auth.uid
+                && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true
+                && (
+                  get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "") == request.resource.data.roleResourceRole
+                  || get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("dashboardRoles", []).hasAny([request.resource.data.roleResourceRole])
+                  || get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("teamLeadRoles", []).hasAny([request.resource.data.roleResourceRole])
+                  || (get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "") == "admin"
+                    && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("adminTeamAssignment", "") in [
+                      "member:" + request.resource.data.roleResourceRole,
+                      "leader:" + request.resource.data.roleResourceRole
+                    ])
+                ))
              || (request.resource.data.type == "dashboard_access"
                && roleIs("admin")
                && request.resource.data.accessScopeType in ["user", "role", "university"]
@@ -1159,15 +2350,18 @@ service cloud.firestore {
                  || validUniversityTag(request.resource.data.accessScopeTarget))
                && dashboardAccessNotificationMatchesMember(uid))
              || (request.resource.data.type == "course_update"
-               && roleIs("admin")
+               && courseManager()
                && request.resource.data.courseId is string
                && exists(/databases/$(database)/documents/courses/$(request.resource.data.courseId))
                && exists(/databases/$(database)/documents/teamMembers/$(uid))
                && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true)
              || (request.resource.data.type == "task_available"
-               && roleIs("admin")
-               && request.resource.data.taskId is string
+                && request.resource.data.taskId is string
+                 && canManageTask(
+                   get(/databases/$(database)/documents/tasks/$(request.resource.data.taskId)).data
+                )
                && exists(/databases/$(database)/documents/tasks/$(request.resource.data.taskId))
+                && request.resource.data.get("taskRole", "") == get(/databases/$(database)/documents/tasks/$(request.resource.data.taskId)).data.get("targetRole", "")
                && taskAudienceMatchesMember(
                  get(/databases/$(database)/documents/tasks/$(request.resource.data.taskId)).data,
                  uid
@@ -1176,15 +2370,31 @@ service cloud.firestore {
                && member()
                && request.resource.data.taskId is string
                && notificationId == "task-submitted_" + request.resource.data.taskId + "_" + request.auth.uid
+                && request.resource.data.get("taskRole", "") == get(/databases/$(database)/documents/tasks/$(request.resource.data.taskId)).data.get("targetRole", "")
                && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true
-               && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "") == "admin"
+                && (
+                  get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "") == "admin"
+                   || (get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "") == "leaders"
+                     && get(/databases/$(database)/documents/tasks/$(request.resource.data.taskId)).data.get("createdBy", "") == uid)
+                  || get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("teamLeadRoles", []).hasAny([
+                    get(/databases/$(database)/documents/tasks/$(request.resource.data.taskId)).data.get("targetRole", "")
+                  ])
+                )
                && get(/databases/$(database)/documents/tasks/$(request.resource.data.taskId)/submissions/$(request.auth.uid)).data.get("submitterUid", "") == request.auth.uid
                && get(/databases/$(database)/documents/tasks/$(request.resource.data.taskId)/submissions/$(request.auth.uid)).data.get("status", "") == "pending")
-             || ((request.resource.data.type == "session_available"
+              || (request.resource.data.type == "academy_calendar_event"
+                && roleIs("admin")
+                && request.resource.data.eventId is string
+                && exists(/databases/$(database)/documents/academyCalendarEvents/$(request.resource.data.eventId))
+                && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true
+                && (get(/databases/$(database)/documents/academyCalendarEvents/$(request.resource.data.eventId)).data.get("audienceRole", "") == "all"
+                  || get(/databases/$(database)/documents/academyCalendarEvents/$(request.resource.data.eventId)).data.get("audienceRole", "") == get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "")))
+              || ((request.resource.data.type == "session_available"
                  || request.resource.data.type == "session_cancelled")
                && sessionManager()
                && request.resource.data.sessionId is string
                && exists(/databases/$(database)/documents/nawrasOnlineSessions/$(request.resource.data.sessionId))
+                && canManageOnlineSession(get(/databases/$(database)/documents/nawrasOnlineSessions/$(request.resource.data.sessionId)).data)
                && ((request.resource.data.type == "session_available"
                    && get(/databases/$(database)/documents/nawrasOnlineSessions/$(request.resource.data.sessionId)).data.get("status", "") == "scheduled")
                  || (request.resource.data.type == "session_cancelled"
@@ -1203,12 +2413,16 @@ service cloud.firestore {
                  uid
                ))
              || (request.resource.data.type == "technical_material"
-                && (roleIs("admin") || hasDashboardAccess("technicalMaterialsManage"))
+                 && (roleIs("admin") || leadsTeamRole("tech") || hasDashboardAccess("technicalMaterialsManage"))
                && request.resource.data.technicalMaterialId is string
                && exists(/databases/$(database)/documents/technicalMaterials/$(request.resource.data.technicalMaterialId))
-               && get(/databases/$(database)/documents/technicalMaterials/$(request.resource.data.technicalMaterialId)).data.createdByUid == request.auth.uid
+                && (get(/databases/$(database)/documents/technicalMaterials/$(request.resource.data.technicalMaterialId)).data.get("createdByUid", "") == request.auth.uid
+                  || get(/databases/$(database)/documents/technicalMaterials/$(request.resource.data.technicalMaterialId)).data.get("updatedByUid", "") == request.auth.uid)
                && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("active", false) == true
                 && (get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "") == "tech"
+                   || get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("teamLeadRoles", []).hasAny(["tech"])
+                   || (get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("role", "") == "admin"
+                     && get(/databases/$(database)/documents/teamMembers/$(uid)).data.get("adminTeamAssignment", "") in ["member:tech", "leader:tech"])
                   || (request.resource.data.technicalAccessGrantId is string
                     && technicalAccessGrantMatchesMember(request.resource.data.technicalAccessGrantId, uid))))
           );

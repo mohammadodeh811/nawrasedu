@@ -1,0 +1,149 @@
+NAWRAS EDU — Google Drive uploads and private previews
+=====================================================
+
+This update keeps the site on InfinityFree and Firebase. It adds a separate
+Cloudflare Worker for secure Drive uploads and previews. It does not replace
+the existing Nawras Online/live-session Worker.
+
+Files to upload to the website
+------------------------------
+Put these files in the same website folder as app.js:
+  admin.html
+  app.js
+  styles.css
+  drive-config.js
+  drive-storage.js
+
+Also publish firestore.rules in Firebase Console (steps below).
+Do not upload the drive-worker folder to InfinityFree.
+
+Step 1 — Enable Google Drive API
+--------------------------------
+1. Open Google Cloud Console and select the Google Cloud project you will use
+   for Drive authorization.
+2. Open APIs & Services > Library.
+3. Search for Google Drive API and click Enable.
+4. Open Google Auth Platform. Configure the consent screen with your app name
+   and your own Google account as a test user if Google asks for that.
+
+Step 2 — Create Google OAuth credentials
+----------------------------------------
+1. In Google Cloud Console, open APIs & Services > Credentials.
+2. Create an OAuth client ID. Choose Web application.
+3. Add this exact Authorized redirect URI:
+   https://developers.google.com/oauthplayground
+4. Save the OAuth client. Keep its client secret private.
+5. Open https://developers.google.com/oauthplayground
+6. Open its settings gear, enable “Use your own OAuth credentials”, then enter
+   the OAuth client ID and secret you just created.
+7. In Step 1, enter this scope:
+   https://www.googleapis.com/auth/drive.file
+8. Authorize with the Google account that should own the NAWRAS EDU uploads.
+9. In Step 2, click “Exchange authorization code for tokens”.
+10. You need the refresh token. Do not paste it into this chat, your website
+    files, or a public code repository. Put it only in Cloudflare Worker Secrets
+    in Step 3.
+
+Google can expire refresh tokens for OAuth apps still in Testing. If Drive
+uploads stop later with an authorization error, check the app's publishing
+status and reconnect the refresh token. Google may require additional consent
+screen verification before an app can be published for broad use.
+
+Step 3 — Create the separate Cloudflare Worker
+----------------------------------------------
+1. Open Cloudflare Dashboard > Workers & Pages > Create > Worker.
+2. Create a Worker named nawras-drive-api.
+3. Open its editor and replace the starter code with the contents of:
+   drive-worker/worker.js
+4. Save and deploy. Leave workers.dev enabled. This Worker is separate from
+   your existing Nawras Online Worker.
+5. Open the new Worker’s Settings > Variables and Secrets.
+6. Add these plain-text variables:
+
+   FIREBASE_PROJECT_ID
+     The project ID from your Firebase project settings.
+
+   WORKER_ALLOWED_ORIGINS
+     Your website origin, including https:// but without a path or trailing
+     slash. Add both the www and non-www origin, separated by a comma, if both
+     versions of your site are used. Example format:
+     https://your-domain.example,https://www.your-domain.example
+
+7. Add these as Worker secrets (not plain-text variables):
+
+   FIREBASE_WEB_API_KEY
+     Copy the Firebase Web API key from your existing Firebase web config.
+
+   GOOGLE_DRIVE_CLIENT_ID
+   GOOGLE_DRIVE_CLIENT_SECRET
+   GOOGLE_DRIVE_REFRESH_TOKEN
+     Use the OAuth values from Step 2.
+
+   MEDIA_TICKET_SECRET
+     A private random string of at least 32 characters used to encrypt
+     short-lived file-preview links. Generate it privately (for example with
+     `openssl rand -hex 32`) and enter it directly into Cloudflare. Never put
+     it in a website file or send it in chat.
+
+8. Save the variables/secrets and deploy the Worker again. Cloudflare will show
+   its workers.dev URL, similar to:
+   https://nawras-drive-api.YOUR-SUBDOMAIN.workers.dev
+
+Step 4 — Point the website to the Worker
+----------------------------------------
+1. Open drive-config.js.
+2. Replace the empty value with your Worker URL, keeping the quotes and
+   omitting a trailing slash. Example:
+
+   export const DRIVE_API_BASE_URL = "https://nawras-drive-api.YOUR-SUBDOMAIN.workers.dev";
+
+3. Upload drive-config.js to the same website folder as app.js.
+
+Step 5 — Publish the updated Firestore rules
+--------------------------------------------
+1. Open Firebase Console > your project > Firestore Database > Rules.
+2. Back up the current rules text before replacing it.
+3. Publish the supplied firestore.rules file.
+   These rules add the Drive metadata fields while preserving private course
+   lesson access and the site's role-based permissions. If your live rules have
+   been changed since the supplied website files were collected, merge these
+   additions into the live rules instead of overwriting newer changes.
+
+Step 6 — Upload the website files
+---------------------------------
+Upload/replace the five website files listed at the top in the same folder on
+InfinityFree. Keep the existing Firebase config and other website files.
+Clear the browser cache or test in a private window after uploading.
+
+What the update does
+--------------------
+• New profile photos are stored in Drive; only the profile image is made
+  viewable to the public, because public profile pages need to display it.
+• New role resources, Technical materials, course lesson files, and task cover
+  photos are private in Drive. The Worker checks the signed-in member and their
+  Firestore access before issuing a one-hour preview link.
+• Videos, images, and PDFs can preview inside the site. Other supported files
+  are offered as protected downloads.
+• Existing external/Drive URLs remain as they are; their current Drive sharing
+  settings still apply. Old ImgBB-hosted photos are not automatically copied.
+• Supported uploads: JPG, PNG, WebP, MP4, WebM, MOV, PDF, TXT, CSV, and common
+  Word/Excel/PowerPoint formats. Maximum: 50 MB per resource, 10 MB per photo.
+• Drive storage belongs to the Google account authorized in Step 2 and counts
+  toward that account's Drive storage.
+
+For task photo support on a site that already has this Drive Worker, replace its
+code with the newly supplied drive-worker/worker.js and deploy it again. The
+task photo uploader will not work with the older Worker.
+
+Testing and limits
+------------------
+No Google account or real Drive file was available during this edit, so the
+real-account upload, preview, and permission flow still needs to be tested
+after Steps 1–6. Start by uploading one small PDF as an admin, then test access
+as a member who should not have that resource. Do not announce the integration
+as verified until both tests pass.
+
+The website and Worker must use HTTPS. Use the exact site origins in
+WORKER_ALLOWED_ORIGINS. If upload or preview fails, check the Worker’s
+Cloudflare logs and confirm the Google OAuth refresh token and Firebase project
+settings are configured; never share their values in a support message.

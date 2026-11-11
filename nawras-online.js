@@ -6,6 +6,8 @@ import {
 } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js";
 import { firebaseConfig } from "./firebase-config.js";
 import { isSessionForMember } from "./personal-calendar-core.js";
+import { hasCapability, loadMemberCapabilities } from "./dashboard-permissions.js";
+import { driveProfilePhotoUrl } from "./drive-storage.js";
 
 const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
 const auth = getAuth(app);
@@ -178,7 +180,7 @@ function setHeroCta(isSignedIn = false) {
 }
 
 function isHost() {
-  return ["admin", "leaders"].includes(state.member?.role);
+  return ["admin", "leaders"].includes(state.member?.role) || hasCapability(state.dashboardCapabilities, "sessionsManage");
 }
 
 function isAdmin() {
@@ -265,7 +267,8 @@ function currentRoomProfile() {
   return {
     uid: state.user?.uid || "",
     displayName: displayName().slice(0, 80),
-    photoURL: roomProfilePhotoUrl(state.member?.photoURL || state.user?.photoURL)
+    photoURL: driveProfilePhotoUrl(state.member?.photoDriveFileId)
+      || roomProfilePhotoUrl(state.member?.photoURL || state.user?.photoURL)
   };
 }
 
@@ -288,7 +291,7 @@ function roleLabel(role) {
 }
 
 function sessionAccess(session) {
-  return isHost() || isSessionForMember(session, state.member);
+  return isAdmin() || isSessionForMember(session, state.member);
 }
 
 async function notifySessionAudience(sessionId, session, type) {
@@ -378,6 +381,21 @@ function setSignedInUI() {
   $("onlineMemberName").textContent = displayName();
   $("onlineMemberRole").textContent = roleLabel(state.member.role);
   $("onlineHostPanel")?.classList.toggle("hidden", !isHost());
+  const audienceSelect = $("onlineCreateForm")?.querySelector("[name=audienceRole]");
+  if (audienceSelect) {
+    Array.from(audienceSelect.options).forEach((option) => {
+      option.disabled = !isAdmin() && !["all", state.member.role].includes(option.value);
+      option.hidden = option.disabled;
+    });
+    if (!isAdmin() && !["all", state.member.role].includes(audienceSelect.value)) audienceSelect.value = state.member.role;
+  }
+  const universitySelect = $("onlineCreateForm")?.querySelector("[name=audienceUniversityTag]");
+  if (universitySelect) {
+    Array.from(universitySelect.options).forEach((option) => {
+      option.disabled = !isAdmin() && !["all", "", state.member.universityTag || ""].includes(option.value);
+      option.hidden = option.disabled;
+    });
+  }
   $("onlineRoomPanel")?.classList.add("hidden");
   $("onlineEndSessionButton")?.classList.toggle("hidden", !isHost());
   updateHandVoiceButton();
@@ -388,13 +406,13 @@ function listenForSessions() {
   state.sessionsUnsubscribe?.();
   if (!state.member) return;
   const base = collection(db, "nawrasOnlineSessions");
-  const queries = isHost()
+  const queries = isAdmin()
     ? [base]
     : [query(
       base,
       where("audienceRole", "in", ["all", state.member.role]),
       where("audienceUniversityTag", "in", [...new Set(["", state.member.universityTag || ""])])
-    ), query(base, where("targetMemberUids", "array-contains", state.user.uid))];
+    ), query(base, where("audienceRole", "==", "targeted"), where("targetMemberUids", "array-contains", state.user.uid))];
   const sources = new Map(), ready = new Set();
   const stops = queries.map((ref, index) => onSnapshot(ref, (snapshot) => {
     if (isAdmin()) void migrateLegacySessionAudiences(snapshot.docs);
@@ -418,7 +436,7 @@ function listenForSessions() {
 function sessionCard(session) {
   const statusLabel = session.status === "live" ? "Live now" : session.status === "ended" ? "Ended" : "Scheduled";
   const statusClass = session.status === "live" ? "is-live" : session.status === "ended" ? "is-ended" : "is-scheduled";
-  const canJoin = session.status === "scheduled" || session.status === "live";
+  const canJoin = sessionAccess(session) && (session.status === "scheduled" || session.status === "live");
   const primaryLabel = isHost() && session.status === "scheduled" ? "Start & join" : "Join session";
   const joinUrl = sessionPageUrl();
   joinUrl.searchParams.set("session", session.id);
@@ -509,14 +527,18 @@ async function createSession(event) {
   const title = String(values.get("title") || "").trim();
   const description = String(values.get("description") || "").trim();
   const audienceRole = String(values.get("audienceRole") || "");
-  const targetMemberUids = [...state.selectedTargets];
+  const targetMemberUids = audienceRole === "targeted" ? [...state.selectedTargets] : [];
   const selectedUniversity = String(values.get("audienceUniversityTag") || "all");
   const audienceUniversityTag = selectedUniversity === "all" ? "" : selectedUniversity;
   const startsAt = new Date(String(values.get("startsAt") || ""));
   if (title.length < 3 || title.length > 100) return toast("Session names must be 3–100 characters.", "error");
   if (!["all", "targeted", ...GROUPS].includes(audienceRole)) return toast("Choose a valid audience.", "error");
+  if (!isAdmin() && !["all", state.member.role].includes(audienceRole)) return toast("You can only schedule sessions for your own account role or all roles.", "error");
   if (audienceRole === "targeted" && !targetMemberUids.length) return toast("Select at least one invited member.", "error");
   if (!UNIVERSITY_TAGS.has(audienceUniversityTag)) return toast("Choose a valid university audience.", "error");
+  if (!isAdmin() && audienceUniversityTag && audienceUniversityTag !== state.member.universityTag) {
+    return toast("Choose your own university or all universities.", "error");
+  }
   if (Number.isNaN(startsAt.getTime())) return toast("Choose a valid start time.", "error");
   const durationMinutes = Number(values.get("durationMinutes") || 60);
   if (!Number.isInteger(durationMinutes) || durationMinutes < 15 || durationMinutes > 480) return toast("Choose a duration between 15 and 480 minutes.", "error");
@@ -1944,6 +1966,7 @@ setupMenu();
 onAuthStateChanged(auth, async (user) => {
   state.user = user;
   state.member = null;
+  state.dashboardCapabilities = {};
   state.targetMembers = [];
   state.selectedTargets.clear();
   if ($("onlineTargetMembers")) $("onlineTargetMembers").innerHTML = "";
@@ -1967,6 +1990,8 @@ onAuthStateChanged(auth, async (user) => {
     }
     const data = profile.data();
     state.member = { uid: user.uid, ...data };
+    state.dashboardCapabilities = await loadMemberCapabilities(db, state.member, () => toast("Some delegated tools could not be loaded. Check the Firestore rules and indexes.", "error"));
+    if (state.user?.uid !== user.uid) return;
     setSignedInUI();
     void loadSessionTargetMembers();
     listenForSessions();

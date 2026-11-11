@@ -1,21 +1,23 @@
 import { initializeApp, getApps, getApp } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js";
 import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, deleteUser, signInAnonymously, signOut, sendPasswordResetEmail } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js";
 import { getFirestore, collection, addDoc, getDocs, getDoc, doc, setDoc, updateDoc, deleteDoc, deleteField, query, where, orderBy, serverTimestamp, runTransaction, writeBatch, onSnapshot } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js";
-import { getMessaging, getToken, onMessage } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-messaging.js";
 import { firebaseConfig } from "./firebase-config.js";
 import { SOCIAL_PLATFORMS, validateSocialLinks, socialLinksMarkup } from "./member-socials.js";
 import { createPersonalPlanner } from "./personal-calendar.js";
+import { isSessionForMember } from "./personal-calendar-core.js";
+import { PERMISSION_GROUPS, DASHBOARD_ACCESS_CAPABILITIES, dashboardCapabilityLabel, hasCapability, loadMemberCapabilities, resourceCapability, expandCapabilities } from "./dashboard-permissions.js";
+import { isDriveStorageConfigured, driveProfilePhotoUrl, driveProfileStickerUrl, uploadDriveFile, requestDrivePreviewTicket, requestDriveProfileStickerPreview, retireDriveProfilePhoto, retireDriveProfileSticker } from "./drive-storage.js?v=20261111-profile-sticker-controls";
+import { createCrossTeamWork } from "./cross-team-work.js?v=20261111-workflow-dashboard-role-access-fix";
 
 const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 let registrationWaiter = null;
-let messaging = null;
-let pushServiceWorkerRegistration = null;
-let foregroundMessagingReady = false;
 let personalPlanner = null;
 const page = document.body.dataset.page || "home";
 const $ = (id) => document.getElementById(id);
+// Remove only the retired push workers; leave unrelated/offline workers alone.
+void retireLegacyPushRegistrations();
 // Retire the public schedule everywhere, including older uploaded page headers.
 document.querySelectorAll('a[href="schedule.html"]').forEach((link) => {
   if (link.classList.contains("directory-card")) {
@@ -33,12 +35,15 @@ const state = {
   activeDashboardSection: "overview",
   courses: [], assignedCourses: [], assignedCoursesUnsubscribe: null, courseAssignments: [], forms: [], memberForms: [], schedule: [], onlineScheduleSessions: [], questions: [], tasks: [], taskSubmissions: {}, teamMembers: [], leaderboardMembers: [], fieldBuilder: [],
   attendanceSessions: [], attendanceSession: null, attendanceVisits: [], attendanceOverrides: new Map(), attendanceRows: [],
-  technicalMaterials: [], dashboardCapabilities: {}, dashboardGrants: [],
+  founderQuestions: [], founderQuestionsLoadGeneration: 0,
+  technicalMaterials: [], roleResources: [], roleResourceLoadWarning: "", dashboardCapabilities: {}, dashboardGrants: [],
   chatPartner: null, chatThreads: [], activeChatId: "", chatMessages: [], chatProfiles: {}, chatThreadsUnsubscribe: null, chatMessagesUnsubscribe: null, chatMessagesChatId: "",
   selectedDay: 4, userSelectedDay: false, searchQuery: "", selectedCategory: "all",
   profilePhotoFile: null, profilePhotoPreviewUrl: "",
-  inboxMessages: [], inboxUnsubscribe: null, selectedRatingUid: "", myRating: null
+  inboxMessages: [], inboxUnsubscribe: null, inboxFilterGeneration: 0,
+  inboxSessionAccessUid: "", inboxSessionAccess: new Map(), selectedRatingUid: "", myRating: null
 };
+let taskSelectedMemberUids = new Set();
 
 const refs = {
   publicCoursesGrid: $("publicCoursesGrid"), publicFormsGrid: $("publicFormsGrid"),
@@ -64,10 +69,10 @@ const refs = {
   chatConversationList: $("chatConversationList"), chatMessages: $("chatMessages"), chatForm: $("chatForm"),
   chatInput: $("chatInput"), chatSendButton: $("chatSendButton"),
   designerResourcesPanel: $("designerResourcesPanel"),
+  roleResourcesGrid: $("roleResourcesGrid"), roleResourcesCount: $("roleResourcesCount"),
   publicQuestionsList: $("publicQuestionsList"), publicQuestionCount: $("publicQuestionCount"),
   askQuestionForm: $("askQuestionForm"), askQuestion: $("askQuestion"),
   askTargetRole: $("askTargetRole"), askQuestionCount: $("askQuestionCount"),
-  notificationStatus: $("notificationStatus"), enableNotificationsBtn: $("enableNotificationsBtn"),
   ratingsPanel: $("ratingsPanel"), ratingsMatrix: $("ratingsMatrix"),
   myRatingsContent: $("myRatingsContent"), myRatingsUpdated: $("myRatingsUpdated"),
   attendancePanel: $("attendancePanel"), attendanceSessionSelect: $("attendanceSessionSelect"),
@@ -88,11 +93,18 @@ const ROLE_CONFIG = {
 };
 const ROLE_ORDER = ["admin", "user", "leaders", "public", "tech", "social", "designers", "content", "event"];
 const ASSIGNABLE_DASHBOARD_ROLES = ["user", "leaders", "public", "tech", "social", "designers", "content", "event"];
-const DASHBOARD_ACCESS_CAPABILITIES = [
-  "formsManage", "formsRead", "formsResponses", "coursesManage", "coursesRead",
-  "technicalMaterialsManage", "technicalMaterialsRead", "designerResourcesRead"
-];
 const DIRECTORY_ROLE_ORDER = ROLE_ORDER.filter((roleKey) => roleKey !== "user");
+const crossTeamWork = createCrossTeamWork({
+  db,
+  getContext: () => ({
+    user: state.user, member: state.member, role: state.role,
+    teamLeadRoles: currentTeamLeadRoles(),
+    dashboardRoles: Array.isArray(state.member?.dashboardRoles) ? state.member.dashboardRoles : []
+  }),
+  canManage: () => state.role === "admin" || currentTeamLeadRoles().includes("event"),
+  notifyInboxMembers,
+  toast: showToast
+});
 const CONTENT_ROLES = ["admin", "tech"];
 const XP_PER_ANSWER = 50;
 const XP_PER_LEVEL = 100;
@@ -104,7 +116,6 @@ const RATING_CATEGORIES = [
   { key: "teamwork", label: "التعاون" },
   { key: "quality", label: "جودة العمل" }
 ];
-const IMGBB_KEY_STORAGE_KEY = "nawras_imgbb_api_key";
 const MAX_PROFILE_PHOTO_BYTES = 10 * 1024 * 1024;
 const UNIVERSITY_OPTIONS = [
   { tag: "AAUP-Jenin", name: "الجامعة العربية الأمريكية-جنين" },
@@ -116,7 +127,42 @@ const UNIVERSITY_OPTIONS = [
 ];
 const UNIVERSITY_BY_TAG = Object.fromEntries(UNIVERSITY_OPTIONS.map((university) => [university.tag, university]));
 
+const DEFAULT_ROLE_RESOURCES = {
+  designers: [
+    { id: "starter-google-fonts", title: "Google Fonts", description: "Browse typefaces and build font pairings.", url: "https://fonts.google.com/", kind: "tool" },
+    { id: "starter-texturelabs", title: "TextureLabs", description: "Find textures, overlays, and visual surfaces.", url: "https://texturelabs.org/", kind: "inspiration" },
+    { id: "starter-hera-motion", title: "HERA Motion Graphics", description: "Explore motion design references and ideas.", url: "https://hera.video/", kind: "inspiration" },
+    { id: "starter-eye-candy", title: "Eye Candy", description: "Collect visual effects and creative assets.", url: "https://eyecannndy.com/", kind: "inspiration" },
+    { id: "starter-color-hexa", title: "Color Hexa", description: "Research color values, shades, and palettes.", url: "https://www.colorhexa.com/", kind: "tool" },
+    { id: "starter-design-readings", title: "Design & UI/UX readings", description: "Browse books and learning resources on GitHub.", url: "https://github.com/ytx-readings/design-ui-ux", kind: "book" },
+    { id: "starter-canva", title: "Canva", description: "Create social graphics, presentations, and more.", url: "https://www.canva.com/", kind: "tool" },
+    { id: "starter-photoshop", title: "Adobe Photoshop", description: "Visit Adobe for official Photoshop information and trial details.", url: "https://www.adobe.com/products/photoshop.html", kind: "tool" }
+  ]
+};
+
 if ($("year")) $("year").textContent = new Date().getFullYear();
+
+async function retireLegacyPushRegistrations() {
+  if (!("serviceWorker" in navigator)) return;
+  try {
+    const legacyNames = new Set(["OneSignalSDKWorker.js", "OneSignalSDKUpdaterWorker.js", "firebase-messaging-sw.js"]);
+    const registrations = await navigator.serviceWorker.getRegistrations();
+    const retired = registrations.filter((registration) => {
+      const workers = [registration.active, registration.waiting, registration.installing].filter(Boolean);
+      return workers.length > 0 && workers.every((worker) => legacyNames.has(new URL(worker.scriptURL).pathname.split("/").pop()));
+    });
+    await Promise.allSettled(retired.map(async (registration) => {
+      try {
+        const subscription = await registration.pushManager?.getSubscription();
+        if (subscription) await subscription.unsubscribe();
+      } finally {
+        await registration.unregister();
+      }
+    }));
+  } catch (_) {
+    // Cleanup must never prevent the public pages or sign-in from loading.
+  }
+}
 
 function showToast(message, type = "ok") {
   const root = $("toastRoot");
@@ -126,92 +172,6 @@ function showToast(message, type = "ok") {
   node.textContent = message;
   root.appendChild(node);
   window.setTimeout(() => node.remove(), 3800);
-}
-
-function setNotificationStatus(message, type = "") {
-  if (!refs.notificationStatus) return;
-  refs.notificationStatus.textContent = message;
-  refs.notificationStatus.classList.toggle("notification-status-error", type === "error");
-  refs.notificationStatus.classList.toggle("notification-status-success", type === "success");
-}
-
-async function preparePushNotifications() {
-  if (!refs.enableNotificationsBtn || !state.user || !state.isTeam) return;
-  if (!("Notification" in window) || !("serviceWorker" in navigator)) {
-    refs.enableNotificationsBtn.disabled = true;
-    setNotificationStatus("This browser does not support push notifications.", "error");
-    return;
-  }
-  if (!firebaseConfig.vapidKey) {
-    setNotificationStatus("Add the Firebase Web Push certificate key in firebase-config.js first.", "error");
-    return;
-  }
-  try {
-    pushServiceWorkerRegistration = await navigator.serviceWorker.register("./firebase-messaging-sw.js");
-    messaging = getMessaging(app);
-    if (!foregroundMessagingReady) {
-      onMessage(messaging, (payload) => {
-        const data = payload?.data || payload?.notification || {};
-        const title = data.title || "NAWRAS EDU";
-        const body = data.body || "You have a new NAWRAS EDU update.";
-        showToast(`${title}: ${body}`);
-      });
-      foregroundMessagingReady = true;
-    }
-    if (Notification.permission === "granted") {
-      setNotificationStatus("Notifications are enabled on this device.", "success");
-      refs.enableNotificationsBtn.textContent = "Notifications enabled";
-    } else if (Notification.permission === "denied") {
-      setNotificationStatus("Notifications are blocked. Allow them in your browser site settings.", "error");
-      refs.enableNotificationsBtn.disabled = true;
-    } else {
-      setNotificationStatus("Enable notifications to receive session reminders and task review updates.");
-    }
-  } catch (error) {
-    setNotificationStatus(`Notifications could not be prepared: ${error?.message || "browser setup failed"}`, "error");
-  }
-}
-
-async function notificationTokenId(token) {
-  if (globalThis.crypto?.subtle && globalThis.TextEncoder) {
-    const buffer = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
-    return Array.from(new Uint8Array(buffer)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
-  }
-  let hash = 0;
-  for (let index = 0; index < token.length; index += 1) hash = ((hash << 5) - hash) + token.charCodeAt(index) | 0;
-  return `fallback_${Math.abs(hash)}`;
-}
-
-async function enablePushNotifications() {
-  if (!state.user || !state.isTeam) return showToast("Sign in to your team dashboard first.", "error");
-  if (!firebaseConfig.vapidKey) return showToast("Add the Firebase Web Push certificate key in firebase-config.js first.", "error");
-  if (!pushServiceWorkerRegistration || !messaging) await preparePushNotifications();
-  if (!pushServiceWorkerRegistration || !messaging) return;
-  try {
-    const permission = await Notification.requestPermission();
-    if (permission !== "granted") {
-      setNotificationStatus(permission === "denied" ? "Notifications were blocked. Allow them in browser site settings." : "Notification permission was not granted.", "error");
-      return;
-    }
-    const token = await getToken(messaging, {
-      vapidKey: firebaseConfig.vapidKey,
-      serviceWorkerRegistration: pushServiceWorkerRegistration
-    });
-    if (!token) throw new Error("Firebase did not return a browser token.");
-    const tokenId = await notificationTokenId(token);
-    await setDoc(doc(db, "teamMembers", state.user.uid, "notificationTokens", tokenId), {
-      uid: state.user.uid,
-      token,
-      platform: "web",
-      updatedAt: serverTimestamp()
-    }, { merge: true });
-    setNotificationStatus("Notifications are enabled on this device.", "success");
-    refs.enableNotificationsBtn.textContent = "Notifications enabled";
-    showToast("You will receive session and task review notifications.");
-  } catch (error) {
-    setNotificationStatus(`Could not enable notifications: ${error?.message || "Firebase setup failed"}`, "error");
-    showToast(firebaseError(error), "error");
-  }
 }
 
 function openModal(id) {
@@ -241,7 +201,10 @@ function setupNavigation() {
 
 document.addEventListener("click", (event) => {
   const closer = event.target.closest("[data-close-modal]");
-  if (closer) closeModal(closer.dataset.closeModal);
+  if (closer) {
+    if (closer.dataset.closeModal === "drivePreviewModal") closeDrivePreview();
+    else closeModal(closer.dataset.closeModal);
+  }
 });
 
 setupNavigation();
@@ -251,6 +214,22 @@ if (refs.dashboardSectionNav) refs.dashboardSectionNav.addEventListener("click",
   state.activeDashboardSection = button.dataset.dashboardSection;
   renderDashboard();
   refs.dashboardSectionNav.querySelector(`[data-dashboard-section="${cssEscape(state.activeDashboardSection)}"]`)?.focus({ preventScroll: true });
+});
+if ($("founderQuestionForm")) $("founderQuestionForm").addEventListener("submit", submitFounderQuestion);
+bindLinkEditors($("founderQuestionForm"));
+if ($("founderAskJump")) $("founderAskJump").addEventListener("click", () => {
+  $("founderAskJump").classList.toggle("is-ringing");
+  $("founderQuestionForm")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  window.setTimeout(() => $("founderQuestionText")?.focus({ preventScroll: true }), 180);
+});
+if ($("founderRoleFilter")) $("founderRoleFilter").addEventListener("change", renderFounderQuestions);
+if ($("founderStatusFilter")) $("founderStatusFilter").addEventListener("change", renderFounderQuestions);
+if ($("founderQuestionSearch")) $("founderQuestionSearch").addEventListener("input", renderFounderQuestions);
+if ($("founderAdminQuestionsList")) $("founderAdminQuestionsList").addEventListener("click", (event) => {
+  const answerButton = event.target.closest("[data-founder-question-answer]");
+  if (answerButton) return void answerFounderQuestion(answerButton.dataset.founderQuestionAnswer);
+  const deleteButton = event.target.closest("[data-founder-question-delete]");
+  if (deleteButton) void deleteFounderQuestion(deleteButton.dataset.founderQuestionDelete);
 });
 
 if (refs.courseSearch) refs.courseSearch.addEventListener("input", (event) => {
@@ -301,6 +280,35 @@ if ($("managedFormAudience")) {
 if ($("addTechnicalMaterialBtn")) $("addTechnicalMaterialBtn").addEventListener("click", openTechnicalMaterialEditor);
 if ($("technicalMaterialForm")) $("technicalMaterialForm").addEventListener("submit", saveTechnicalMaterial);
 if (refs.technicalMaterialsGrid) refs.technicalMaterialsGrid.addEventListener("click", handleTechnicalMaterialsClick);
+if ($("technicalMaterialFile")) $("technicalMaterialFile").addEventListener("change", () => {
+  const file = $("technicalMaterialFile").files?.[0];
+  if (file) {
+    $("technicalMaterialUrl").value = "";
+    $("technicalMaterialCurrentFile").textContent = `Selected: ${file.name}. It uploads when you save.`;
+  }
+});
+if ($("addRoleResourceBtn")) $("addRoleResourceBtn").addEventListener("click", () => openRoleResourceEditor());
+if ($("roleResourceForm")) $("roleResourceForm").addEventListener("submit", saveRoleResource);
+if (refs.roleResourcesGrid) refs.roleResourcesGrid.addEventListener("click", handleRoleResourcesClick);
+if (refs.tasksList) {
+  refs.tasksList.addEventListener("click", (event) => {
+    const card = event.target.closest("[data-open-task-card]");
+    if (card && refs.tasksList.contains(card)) openTaskDetails(card.dataset.openTaskCard);
+  });
+  refs.tasksList.addEventListener("keydown", (event) => {
+    const card = event.target.closest("[data-open-task-card]");
+    if (!card || event.target !== card || !["Enter", " "].includes(event.key)) return;
+    event.preventDefault();
+    openTaskDetails(card.dataset.openTaskCard);
+  });
+}
+if ($("roleResourceFile")) $("roleResourceFile").addEventListener("change", () => {
+  const file = $("roleResourceFile").files?.[0];
+  if (file) {
+    $("roleResourceUrl").value = "";
+    $("roleResourceCurrentFile").textContent = `Selected: ${file.name}. It uploads when you save.`;
+  }
+});
 document.addEventListener("click", (event) => {
   if (event.target.closest("#clearMemberInboxBtn")) clearMemberInbox();
 });
@@ -406,12 +414,31 @@ if ($("courseAssetRows")) $("courseAssetRows").addEventListener("click", (event)
   removeButton.closest("[data-course-asset-row]")?.remove();
   if (!$("courseAssetRows").querySelector("[data-course-asset-row]")) renderCourseAssetEmptyState();
 });
+if ($("courseAssetRows")) $("courseAssetRows").addEventListener("change", (event) => {
+  const fileInput = event.target.closest("[data-course-asset-file]");
+  if (!fileInput?.files?.[0]) return;
+  const row = fileInput.closest("[data-course-asset-row]");
+  const urlInput = row?.querySelector("[data-course-asset-url]");
+  if (urlInput) urlInput.value = "";
+  const existing = row?.querySelector("[data-course-asset-existing]");
+  if (existing) existing.textContent = `Selected: ${fileInput.files[0].name}. It uploads when you save the course.`;
+});
 if ($("courseAssigneeSearch")) $("courseAssigneeSearch").addEventListener("input", () => {
   renderCourseAssignees(selectedCourseAssignees());
 });
 if ($("formBuilder")) $("formBuilder").addEventListener("submit", saveManagedForm);
 if ($("scheduleForm")) $("scheduleForm").addEventListener("submit", saveSchedule);
   if ($("taskForm")) $("taskForm").addEventListener("submit", saveTask);
+  if ($("taskImageFile")) $("taskImageFile").addEventListener("change", previewTaskCoverSelection);
+if ($("taskTargetRole")) $("taskTargetRole").addEventListener("change", () => refreshTaskMemberSelector([]));
+if ($("taskTargetUniversity")) $("taskTargetUniversity").addEventListener("change", () => refreshTaskMemberSelector([]));
+if ($("taskMemberSearch")) $("taskMemberSearch").addEventListener("input", () => refreshTaskMemberSelector());
+if ($("taskAssignedMembers")) $("taskAssignedMembers").addEventListener("change", (event) => {
+  const input = event.target.closest('input[type="checkbox"]');
+  if (!input) return;
+  if (input.checked) taskSelectedMemberUids.add(input.value);
+  else taskSelectedMemberUids.delete(input.value);
+});
   setupTaskExtraFields();
 if ($("profileForm")) {
   addProfilePhotoControls();
@@ -419,10 +446,13 @@ if ($("profileForm")) {
   $("profileForm").addEventListener("submit", saveProfile);
 }
 if (refs.chatForm) refs.chatForm.addEventListener("submit", sendChatMessage);
-if (refs.enableNotificationsBtn) refs.enableNotificationsBtn.addEventListener("click", enablePushNotifications);
 if (refs.askQuestionForm) refs.askQuestionForm.addEventListener("submit", submitQuestion);
 if (refs.askQuestion) refs.askQuestion.addEventListener("input", () => {
   if (refs.askQuestionCount) refs.askQuestionCount.textContent = `${refs.askQuestion.value.length} / 1000`;
+});
+refs.teamMembersList?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-toggle-member-active]");
+  if (button) void setTeamMemberActive(button.dataset.toggleMemberActive, button);
 });
 if ($("dashboardAccessScopeType")) {
   $("dashboardAccessScopeType").addEventListener("change", () => {
@@ -446,12 +476,17 @@ function canManageForms() {
 
 function hasDashboardAccess(capability) {
   if (state.role === "admin") return true;
-  if (state.dashboardCapabilities?.[capability]) return true;
-  if (capability === "formsRead") return Boolean(state.dashboardCapabilities?.formsManage || state.dashboardCapabilities?.formsResponses);
-  if (capability === "coursesRead") return Boolean(state.dashboardCapabilities?.coursesManage);
-  if (capability === "technicalMaterialsRead") return Boolean(state.dashboardCapabilities?.technicalMaterialsManage);
-  return false;
+  return hasCapability(state.dashboardCapabilities, capability);
 }
+
+function canReadAttendance() { return hasDashboardAccess("attendanceRead"); }
+function canManageAttendance() { return hasDashboardAccess("attendanceManage"); }
+function canManageMemberAssignments(member = null) {
+  return state.role === "admin" || (hasDashboardAccess("membersManage")
+    && (!member || (member.role !== "admin" && member.uid !== state.user?.uid && member.active !== false)));
+}
+function canReadAllRatings() { return hasDashboardAccess("ratingsRead"); }
+function canReadAllTeam() { return hasDashboardAccess("teamRead"); }
 
 function canReadManagedForms() {
   return canManageForms() || hasDashboardAccess("formsRead") || hasDashboardAccess("formsResponses");
@@ -470,15 +505,44 @@ function canReadCourses() {
 }
 
 function canReadTechnicalMaterials() {
-  return ["admin", "tech"].includes(state.role) || hasDashboardAccess("technicalMaterialsRead");
+  return ["admin", "tech"].includes(state.role)
+    || currentTeamLeadRoles().includes("tech")
+    || hasDashboardAccess("technicalMaterialsRead");
 }
 
 function canManageTechnicalMaterials() {
-  return state.role === "admin" || hasDashboardAccess("technicalMaterialsManage");
+  return state.role === "admin"
+    || currentTeamLeadRoles().includes("tech")
+    || hasDashboardAccess("technicalMaterialsManage");
 }
 
 function canViewDesignerResources(roleKey = state.activeDashboardRole) {
   return roleKey === "designers" || hasDashboardAccess("designerResourcesRead");
+}
+
+function canReadRoleResources(roleKey = state.activeDashboardRole) {
+  if (!ASSIGNABLE_DASHBOARD_ROLES.includes(roleKey) || !state.isTeam) return false;
+  const assignedDashboards = Array.isArray(state.member?.dashboardRoles) ? state.member.dashboardRoles : [];
+  return state.role === "admin"
+    || state.role === roleKey
+    || (roleKey === "leaders" && isPositionLeader(state.member))
+    || currentTeamLeadRoles().includes(roleKey)
+    || assignedDashboards.includes(roleKey)
+    || hasDashboardAccess(resourceCapability(roleKey));
+}
+
+function canManageRoleResources(roleKey) {
+  return ASSIGNABLE_DASHBOARD_ROLES.includes(roleKey)
+    && (state.role === "admin" || currentTeamLeadRoles().includes(roleKey)
+      || hasDashboardAccess(resourceCapability(roleKey, "Manage")));
+}
+
+function isRoleLeaderForDashboard(roleKey) {
+  if (state.role === "admin") {
+    const assignment = adminTeamAssignment(state.member);
+    return assignment?.position === "leader" && assignment.role === roleKey;
+  }
+  return currentTeamLeadRoles().includes(roleKey);
 }
 
 function dashboardGrantId(scopeType, target, capability) {
@@ -502,50 +566,39 @@ function dashboardAccessRecipients(scopeType, target) {
         : scopeType === "university" && member.universityTag === target));
 }
 
-function dashboardCapabilityLabel(capability) {
-  return ({
-    formsManage: "Create & manage forms",
-    formsRead: "Read all forms",
-    formsResponses: "Read form submissions",
-    coursesManage: "Create & manage courses",
-    coursesRead: "Read course library",
-    technicalMaterialsManage: "Manage Technical materials",
-    technicalMaterialsRead: "Read Technical materials",
-    designerResourcesRead: "View designer resources"
-  })[capability] || capability;
+async function loadDashboardAccess() {
+  let failed = false;
+  state.dashboardCapabilities = await loadMemberCapabilities(db, state.member, () => { failed = true; });
+  if (failed) showToast("Some granted tools could not be loaded. Check the updated Firestore rules and indexes.", "error");
 }
 
-async function loadDashboardAccess() {
-  state.dashboardCapabilities = {};
-  if (!state.user || !state.member || state.role === "admin") {
-    if (state.role === "admin") state.dashboardCapabilities = Object.fromEntries(DASHBOARD_ACCESS_CAPABILITIES.map((key) => [key, true]));
-    return;
-  }
-  const targets = [
-    ["user", state.user.uid],
-    ["role", state.role],
-    ["university", String(state.member.universityTag || "").trim()]
-  ].filter(([, target]) => target);
-  const requests = targets.flatMap(([scopeType, target]) => DASHBOARD_ACCESS_CAPABILITIES.map(async (capability) => {
-    const grantId = dashboardGrantId(scopeType, target, capability);
-    try {
-      const snapshot = await getDoc(doc(db, "dashboardAccessGrants", grantId));
-      return [capability, snapshot.exists() && snapshot.data().active === true];
-    } catch (error) {
-      // Fail closed if the matching grant cannot be read (for example, before
-      // the matching Firestore rules have been deployed).
-      console.warn("Dashboard grant check failed:", grantId, error?.code || error?.message);
-      return [capability, false];
-    }
-  }));
-  const results = await Promise.all(requests);
-  for (const [capability, active] of results) {
-    if (active) state.dashboardCapabilities[capability] = true;
-  }
+function renderDashboardPermissionOptions() {
+  const container = $("dashboardPermissionOptions");
+  if (!container || container.dataset.ready === "true") return;
+  container.dataset.ready = "true";
+  container.innerHTML = PERMISSION_GROUPS.map((group, index) => `<details class="permission-group" ${index < 3 ? "open" : ""}>
+    <summary>${escapeHtml(group.title)}${group.sensitive ? `<span class="permission-sensitive">Destructive</span>` : ""}</summary>
+    <div class="permission-group-options">${group.items.map(([key, label]) => `<label class="check-row"><input type="checkbox" name="dashboardCapability" value="${escapeAttr(key)}"><span>${escapeHtml(label)}</span></label>`).join("")}</div>
+  </details>`).join("");
+  $("permissionSearch")?.addEventListener("input", (event) => {
+    const queryText = event.target.value.trim().toLowerCase();
+    container.querySelectorAll(".permission-group").forEach((group) => {
+      const match = !queryText || group.textContent.toLowerCase().includes(queryText);
+      group.hidden = !match;
+      if (queryText && match) group.open = true;
+    });
+  });
+  $("permissionSelectAll")?.addEventListener("click", () => {
+    container.querySelectorAll('input[name="dashboardCapability"]').forEach((input) => {
+      if (!input.closest(".permission-group").hidden) input.checked = true;
+    });
+  });
+  $("permissionClearAll")?.addEventListener("click", () => populateDashboardAccessChecks([]));
 }
 
 async function loadDashboardGrantAdmin() {
   if (state.role !== "admin") return;
+  renderDashboardPermissionOptions();
   try {
     const snapshot = await getDocs(collection(db, "dashboardAccessGrants"));
     state.dashboardGrants = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))
@@ -614,12 +667,17 @@ function syncDashboardAccessChecks() {
 function renderDashboardAccessGrantList() {
   const root = refs.dashboardAccessGrantsList;
   if (!root) return;
-  root.innerHTML = state.dashboardGrants.length
-    ? `<div class="dashboard-access-grant-list">${state.dashboardGrants.map((grant) => {
-      const scopeLabel = grant.scopeType === "user" ? "Member" : grant.scopeType === "role" ? "Role" : "University";
-      return `<article class="dashboard-access-grant-row"><div><strong>${escapeHtml(dashboardCapabilityLabel(grant.capability))}</strong><small>${escapeHtml(scopeLabel)} · ${escapeHtml(dashboardGrantTargetLabel(grant.scopeType, grant.scopeTarget))}</small></div><div class="admin-actions"><button class="btn btn-outline btn-compact" type="button" data-edit-dashboard-grant="${escapeAttr(grant.id)}">Edit access set</button><button class="btn btn-danger btn-compact" type="button" data-remove-dashboard-grant="${escapeAttr(grant.id)}">Remove</button></div></article>`;
-    }).join("")}</div>`
-    : `<div class="empty-state">No extra dashboard access has been granted.</div>`;
+  const groups = new Map();
+  for (const grant of state.dashboardGrants) {
+    const key = `${grant.scopeType}:${grant.scopeTarget}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(grant);
+  }
+  root.innerHTML = groups.size ? `<div class="dashboard-access-grant-list">${[...groups.values()].map((grants) => {
+    const first = grants[0];
+    const scopeLabel = first.scopeType === "user" ? "Member" : first.scopeType === "role" ? "Role" : "University";
+    return `<details class="permission-group"><summary>${escapeHtml(scopeLabel)} · ${escapeHtml(dashboardGrantTargetLabel(first.scopeType, first.scopeTarget))} <small>(${grants.length})</small></summary><div class="permission-group-options"><button class="btn btn-outline btn-compact" type="button" data-edit-dashboard-grant="${escapeAttr(first.id)}">Edit access set</button>${grants.map((grant) => `<article class="dashboard-access-grant-row"><strong>${escapeHtml(dashboardCapabilityLabel(grant.capability))}</strong><button class="btn btn-danger btn-compact" type="button" data-remove-dashboard-grant="${escapeAttr(grant.id)}">Remove</button></article>`).join("")}</div></details>`;
+  }).join("")}</div>` : `<div class="empty-state">No extra access grants.</div>`;
 }
 
 async function saveDashboardAccessGrant(event) {
@@ -632,7 +690,7 @@ async function saveDashboardAccessGrant(event) {
       ? Boolean(universityByTag(target))
       : scopeType === "user" && state.teamMembers.some((member) => member.uid === target && member.active !== false && member.role !== "admin");
   if (!validTarget) return showToast("Choose a valid role, university, or active member.", "error");
-  const selected = [...document.querySelectorAll('[name="dashboardCapability"]:checked')].map((input) => input.value);
+  const selected = expandCapabilities([...document.querySelectorAll('[name="dashboardCapability"]:checked')].map((input) => input.value));
   if (selected.some((capability) => !DASHBOARD_ACCESS_CAPABILITIES.includes(capability))) return showToast("Choose only listed dashboard permissions.", "error");
   try {
     const previous = state.dashboardGrants.filter((grant) => grant.scopeType === scopeType && grant.scopeTarget === target);
@@ -658,9 +716,10 @@ async function saveDashboardAccessGrant(event) {
     if (added.length || removed.length) {
       const recipients = dashboardAccessRecipients(scopeType, target);
       const scopeLabel = dashboardGrantTargetLabel(scopeType, target);
+      const summary = (keys) => `${keys.slice(0, 3).map(dashboardCapabilityLabel).join(", ")}${keys.length > 3 ? `, and ${keys.length - 3} more` : ""}`;
       const details = [
-        added.length ? `Granted: ${added.map(dashboardCapabilityLabel).join(", ")}.` : "",
-        removed.length ? `Removed: ${removed.map(dashboardCapabilityLabel).join(", ")}.` : ""
+        added.length ? `Granted: ${summary(added)}.` : "",
+        removed.length ? `Removed: ${summary(removed)}.` : ""
       ].filter(Boolean).join(" ");
       try {
         await notifyInboxMembers(
@@ -701,7 +760,11 @@ function handleDashboardAccessGrantClick(event) {
   const removeButton = event.target.closest("[data-remove-dashboard-grant]");
   if (!removeButton) return;
   const grant = state.dashboardGrants.find((item) => item.id === removeButton.dataset.removeDashboardGrant);
-  if (!grant || !window.confirm(`Remove “${dashboardCapabilityLabel(grant.capability)}” for ${dashboardGrantTargetLabel(grant.scopeType, grant.scopeTarget)}?`)) return;
+  if (!grant) return;
+  const remaining = state.dashboardGrants.filter((item) => item.id !== grant.id
+    && item.scopeType === grant.scopeType && item.scopeTarget === grant.scopeTarget).map((item) => item.capability);
+  if (expandCapabilities(remaining).includes(grant.capability)) return showToast("This permission is included in another enabled action. Edit the access set and remove that action first.", "info");
+  if (!window.confirm(`Remove “${dashboardCapabilityLabel(grant.capability)}” for ${dashboardGrantTargetLabel(grant.scopeType, grant.scopeTarget)}?`)) return;
   (async () => {
     try {
       await deleteDoc(doc(db, "dashboardAccessGrants", grant.id));
@@ -762,9 +825,203 @@ async function submitQuestion(event) {
   }
 }
 
+async function submitFounderQuestion(event) {
+  event.preventDefault();
+  if (!state.user?.uid || !state.member || !ROLE_CONFIG[state.role]) {
+    return showToast("Sign in with an active NAWRAS EDU account before messaging the founders.", "error");
+  }
+  const input = $("founderQuestionText");
+  const question = input?.value.trim() || "";
+  if (question.length < 8) return showToast("Please write at least 8 characters so the founders have enough context.", "error");
+  if (question.length > 1500) return showToast("Keep your question under 1,500 characters.", "error");
+  const linkResult = collectLinkEntries(findLinkEditor($("founderQuestionForm"), "founderQuestion"));
+  if (linkResult.error) return showToast(linkResult.error, "error");
+  const submit = $("founderQuestionSubmit");
+  if (submit) {
+    submit.disabled = true;
+    submit.classList.add("is-sending");
+    const label = submit.querySelector(".founder-send-copy");
+    if (label) label.textContent = "Sending your question…";
+  }
+  try {
+    const requestRef = doc(collection(db, "founderQuestions"));
+    await setDoc(requestRef, {
+      question,
+      questionLinks: linkResult.links,
+      ownerUid: state.user.uid,
+      ownerName: memberDisplayName(state.member, state.user).slice(0, 80),
+      ownerRole: state.role,
+      status: "open",
+      createdAt: serverTimestamp()
+    });
+    if (input) input.value = "";
+    $("founderQuestionForm")?.querySelectorAll(".link-editor-rows").forEach((rows) => { rows.innerHTML = ""; });
+    showToast("Your question has been sent privately to the founders.");
+    await loadFounderQuestions();
+  } catch (error) {
+    showToast(`Your question could not be sent: ${firebaseError(error)}`, "error");
+  } finally {
+    if (submit) {
+      submit.disabled = false;
+      submit.classList.remove("is-sending");
+      const label = submit.querySelector(".founder-send-copy");
+      if (label) label.textContent = "Send to the founders";
+    }
+  }
+}
+
+async function loadFounderQuestions() {
+  const generation = ++state.founderQuestionsLoadGeneration;
+  const uid = state.user?.uid || "";
+  if (!uid || !state.member) return;
+  const mine = $("founderMyQuestionsList");
+  const queue = $("founderAdminQuestionsList");
+  if (state.role === "admin" && queue) queue.innerHTML = `<div class="empty-state">Loading every role’s messages…</div>`;
+  else if (mine) mine.innerHTML = `<div class="empty-state">Loading your messages…</div>`;
+  try {
+    const source = collection(db, "founderQuestions");
+    const snapshot = state.role === "admin"
+      ? await getDocs(source)
+      : await getDocs(query(source, where("ownerUid", "==", uid)));
+    if (generation !== state.founderQuestionsLoadGeneration || state.user?.uid !== uid) return;
+    state.founderQuestions = snapshot.docs
+      .map((item) => ({ id: item.id, ...item.data() }))
+      .sort((a, b) => sortTimestampDesc(a.createdAt, b.createdAt));
+    renderFounderQuestions();
+  } catch (error) {
+    if (generation !== state.founderQuestionsLoadGeneration) return;
+    const message = `Messages could not be loaded. ${firebaseError(error)}`;
+    if (state.role === "admin" && queue) queue.innerHTML = `<div class="empty-state">${escapeHtml(message)}</div>`;
+    else if (mine) mine.innerHTML = `<div class="empty-state">${escapeHtml(message)}</div>`;
+    showToast(message, "error");
+  }
+}
+
+function founderQuestionReplyMarkup(item) {
+  return item.status === "answered"
+    ? `<div class="founder-reply-card"><div class="founder-reply-heading"><span class="material-symbols-outlined" aria-hidden="true">mark_chat_read</span><div><strong>Founder reply</strong><small>${escapeHtml(item.answeredByName || "NAWRAS EDU founder")} · ${escapeHtml(formatDate(item.answeredAt))}</small></div></div><p>${escapeHtml(item.answer || "")}</p>${renderLinkButtons(item.answerLinks)}</div>`
+    : `<div class="founder-waiting-note"><span class="material-symbols-outlined" aria-hidden="true">schedule</span><span>Sent to the founders · waiting for a reply</span></div>`;
+}
+
+function founderQuestionRoleCard(item) {
+  const status = item.status === "answered" ? "Answered" : "Awaiting reply";
+  return `<article class="founder-question-card ${item.status === "answered" ? "is-answered" : "is-open"}"><div class="founder-question-meta"><span class="founder-question-status ${item.status === "answered" ? "is-answered" : ""}">${status}</span><time>${escapeHtml(formatDate(item.createdAt))}</time></div><p class="founder-question-text">${escapeHtml(item.question || "")}</p>${renderLinkButtons(item.questionLinks)}${founderQuestionReplyMarkup(item)}</article>`;
+}
+
+function founderQuestionAdminCard(item) {
+  const roleLabel = ROLE_CONFIG[item.ownerRole]?.label || item.ownerRole || "Member";
+  return `<article class="founder-admin-question-card ${item.status === "answered" ? "is-answered" : "is-open"}"><div class="founder-admin-question-head"><div class="founder-admin-requester"><span class="founder-requester-avatar" aria-hidden="true">${escapeHtml(String(item.ownerName || "M").trim().charAt(0).toUpperCase())}</span><div><strong>${escapeHtml(item.ownerName || "NAWRAS member")}</strong><small>${escapeHtml(roleLabel)} · ${escapeHtml(formatDate(item.createdAt))}</small></div></div><span class="founder-question-status ${item.status === "answered" ? "is-answered" : ""}">${item.status === "answered" ? "Answered" : "Needs a reply"}</span></div><p class="founder-question-text">${escapeHtml(item.question || "")}</p>${renderLinkButtons(item.questionLinks)}${item.status === "answered"
+    ? `<div class="founder-reply-card"><div class="founder-reply-heading"><span class="material-symbols-outlined" aria-hidden="true">mark_chat_read</span><div><strong>Reply sent to ${escapeHtml(item.ownerName || "member")}</strong><small>${escapeHtml(item.answeredByName || "Admin")} · ${escapeHtml(formatDate(item.answeredAt))}</small></div></div><p>${escapeHtml(item.answer || "")}</p>${renderLinkButtons(item.answerLinks)}</div>`
+    : `<form class="founder-admin-reply-form" data-founder-reply-form="${escapeAttr(item.id)}"><label for="founder-answer-${escapeAttr(item.id)}">Reply to ${escapeHtml(item.ownerName || "this member")}</label><textarea id="founder-answer-${escapeAttr(item.id)}" maxlength="1500" rows="3" placeholder="Write a thoughtful reply…" required></textarea>${linkEditorMarkup("founder-answer", `founderAnswer-${item.id}`, "Add a reply link", "Optional links to include with this reply.")}<button class="btn btn-primary btn-compact" type="button" data-founder-question-answer="${escapeAttr(item.id)}"><span class="material-symbols-outlined" aria-hidden="true">send</span> Send reply to inbox</button></form>`}<button class="btn btn-danger btn-compact founder-question-delete" type="button" data-founder-question-delete="${escapeAttr(item.id)}"><span class="material-symbols-outlined" aria-hidden="true">delete</span> Delete question</button></article>`;
+}
+
+function renderFounderQuestions() {
+  const mine = $("founderMyQuestionsList");
+  const adminList = $("founderAdminQuestionsList");
+  const isAdmin = state.role === "admin";
+  $("founderPanel")?.setAttribute("data-role-theme", state.activeDashboardRole || state.role || "user");
+  $("founderAdminQueue")?.classList.toggle("hidden", !isAdmin);
+  $("founderMyQuestions")?.classList.toggle("hidden", isAdmin);
+  if ($("founderIntroCopy")) {
+    $("founderIntroCopy").textContent = isAdmin
+      ? "Review private messages from every team role and send each reply directly to the member’s inbox."
+      : `Send Nawras and Duha a private question as ${ROLE_CONFIG[state.role]?.label || "a NAWRAS EDU member"}. Replies will arrive in your inbox.`;
+  }
+  if (mine && !isAdmin) {
+    mine.innerHTML = state.founderQuestions.length
+      ? state.founderQuestions.map(founderQuestionRoleCard).join("")
+      : `<div class="founder-empty-state"><span class="material-symbols-outlined" aria-hidden="true">forum</span><strong>Your first note can start here.</strong><p>Questions and private founder replies will appear here.</p></div>`;
+  }
+  if (!isAdmin || !adminList) return;
+
+  const roleFilter = $("founderRoleFilter");
+  const statusFilter = $("founderStatusFilter");
+  if (roleFilter && roleFilter.options.length < ROLE_ORDER.length + 1) {
+    const previous = roleFilter.value || "all";
+    roleFilter.innerHTML = `<option value="all">All roles</option>${ROLE_ORDER.map((role) => `<option value="${escapeAttr(role)}">${escapeHtml(ROLE_CONFIG[role]?.label || role)}</option>`).join("")}`;
+    roleFilter.value = ROLE_ORDER.includes(previous) ? previous : "all";
+  }
+  const search = ($("founderQuestionSearch")?.value || "").trim().toLowerCase();
+  const selectedRole = roleFilter?.value || "all";
+  const selectedStatus = statusFilter?.value || "all";
+  const filtered = state.founderQuestions.filter((item) => {
+    const statusMatch = selectedStatus === "all" || item.status === selectedStatus;
+    const roleMatch = selectedRole === "all" || item.ownerRole === selectedRole;
+    const searchMatch = !search || `${item.ownerName || ""} ${item.question || ""} ${ROLE_CONFIG[item.ownerRole]?.label || item.ownerRole || ""}`.toLowerCase().includes(search);
+    return statusMatch && roleMatch && searchMatch;
+  });
+  const openCount = state.founderQuestions.filter((item) => item.status === "open").length;
+  if ($("founderQueueCount")) $("founderQueueCount").textContent = `${openCount} awaiting · ${state.founderQuestions.length} total`;
+  const visibleRoles = selectedRole === "all" ? ROLE_ORDER : [selectedRole];
+  adminList.innerHTML = visibleRoles.map((role) => {
+    const items = filtered.filter((item) => item.ownerRole === role);
+    return `<section class="founder-role-group"><div class="founder-role-group-heading"><h4>${escapeHtml(ROLE_CONFIG[role]?.label || role)}</h4><span>${items.length} message${items.length === 1 ? "" : "s"}</span></div>${items.length
+      ? items.map(founderQuestionAdminCard).join("")
+      : `<div class="founder-role-empty">${search || selectedStatus !== "all" ? "No matching questions." : "No questions from this role yet."}</div>`}</section>`;
+  }).join("");
+  bindLinkEditors(adminList);
+}
+
+async function answerFounderQuestion(id) {
+  if (state.role !== "admin" || !state.user?.uid) return showToast("Only admins can answer founder messages.", "error");
+  const item = state.founderQuestions.find((question) => question.id === id);
+  if (!item || item.status !== "open" || !item.ownerUid) return showToast("This message has already been answered or is unavailable.", "error");
+  const answer = $(`founder-answer-${id}`)?.value.trim() || "";
+  if (answer.length < 8) return showToast("Write at least 8 characters in your reply.", "error");
+  const answerLinks = collectLinkEntries(findLinkEditor($("founderAdminQuestionsList"), `founderAnswer-${id}`));
+  if (answerLinks.error) return showToast(answerLinks.error, "error");
+  const requestRef = doc(db, "founderQuestions", id);
+  const notificationRef = doc(db, "teamMembers", item.ownerUid, "notifications", `founder-answer_${id}`);
+  const adminName = memberDisplayName(state.member, state.user).slice(0, 80);
+  try {
+    await runTransaction(db, async (transaction) => {
+      const requestSnapshot = await transaction.get(requestRef);
+      if (!requestSnapshot.exists() || requestSnapshot.data().status !== "open"
+        || requestSnapshot.data().ownerUid !== item.ownerUid) {
+        throw new Error("This message was answered by another admin. Refresh the queue.");
+      }
+      transaction.update(requestRef, {
+        status: "answered", answer, answeredByUid: state.user.uid,
+        answerLinks: answerLinks.links, answeredByName: adminName, answeredAt: serverTimestamp()
+      });
+      transaction.set(notificationRef, inboxNotificationData(
+        "founder_answer",
+        "A founder replied to your question",
+        "Your private question has a reply from the NAWRAS EDU founders.",
+        {
+          questionId: id, founderQuestion: item.question, founderAnswer: answer,
+          founderQuestionLinks: item.questionLinks || [], founderAnswerLinks: answerLinks.links
+        }
+      ));
+    });
+    showToast(`Your reply was sent to ${item.ownerName || "the member"}’s inbox.`);
+    await loadFounderQuestions();
+  } catch (error) {
+    showToast(`The reply could not be sent: ${firebaseError(error)}`, "error");
+  }
+}
+
+async function deleteFounderQuestion(id) {
+  if (state.role !== "admin" || !state.user?.uid) {
+    return showToast("Only admins can delete founder questions.", "error");
+  }
+  const item = state.founderQuestions.find((question) => question.id === id);
+  if (!item) return showToast("This founder question is no longer available. Refresh the page.", "error");
+  const status = item.status === "answered" ? "answered" : "unanswered";
+  if (!window.confirm(`Delete this ${status} founder question from ${item.ownerName || "this member"}? This cannot be undone.`)) return;
+  try {
+    await deleteDoc(doc(db, "founderQuestions", id));
+    state.founderQuestions = state.founderQuestions.filter((question) => question.id !== id);
+    renderFounderQuestions();
+    showToast("Founder question deleted.");
+  } catch (error) {
+    showToast(`The founder question could not be deleted: ${firebaseError(error)}`, "error");
+  }
+}
+
 function inboxNotificationData(type, title, message, extra = {}) {
   return {
-    type, title, message, actorUid: state.user?.uid || "",
+    type, title: String(title || "").slice(0, 120), message: String(message || "").slice(0, 1500), actorUid: state.user?.uid || "",
     actorName: memberDisplayName(state.member, state.user),
     createdAt: serverTimestamp(), read: false, ...extra
   };
@@ -803,15 +1060,19 @@ function renderMemberInbox(items) {
     <article class="inbox-message ${item.read ? "is-read" : "is-unread"}">
       <div class="inbox-message-top"><strong>${escapeHtml(item.title || "NAWRAS update")}</strong><time>${escapeHtml(formatDate(item.createdAt))}</time></div>
       <p>${escapeHtml(item.message || "")}</p>
+       ${item.type === "founder_answer" ? `<div class="founder-inbox-answer">${item.founderQuestion ? `<div class="founder-inbox-question"><span>Your question</span><p>${escapeHtml(item.founderQuestion)}</p>${renderLinkButtons(item.founderQuestionLinks)}</div>` : ""}<div class="founder-inbox-reply"><span>Reply from the founders</span><p>${escapeHtml(item.founderAnswer || "")}</p>${renderLinkButtons(item.founderAnswerLinks)}</div></div><a class="btn btn-primary btn-compact" href="admin.html?view=ask-founder">Open Ask Founder ↗</a>` : ""}
+       ${item.type === "cross_team_work" && item.workflowId ? `<a class="btn btn-primary btn-compact" href="admin.html?view=cross-team-work&amp;workflow=${encodeURIComponent(item.workflowId)}">Open Cross-Team Work ↗</a>` : ""}
       ${item.actorName ? `<small>From ${escapeHtml(item.actorName)}</small>` : ""}
       ${item.type === "form_available" && item.formId ? `<a class="btn btn-outline btn-compact inbox-open-form" href="${escapeAttr(formShareUrl(item.formId))}">Open form ↗</a>` : ""}
       ${item.type === "form_response" ? `<a class="btn btn-outline btn-compact" href="admin.html?view=responses">View form submissions ↗</a>` : ""}
       ${item.type === "question_received" ? `<a class="btn btn-outline btn-compact" href="admin.html?view=questions">Open questions ↗</a>` : ""}
       ${item.type === "chat_message" ? `<a class="btn btn-outline btn-compact" href="admin.html?view=chat">Open leader chat ↗</a>` : ""}
       ${item.type === "technical_material" && item.technicalMaterialId ? `<a class="btn btn-outline btn-compact inbox-open-technical-material" href="admin.html?technicalMaterial=${encodeURIComponent(item.technicalMaterialId)}">Open Technical materials ↗</a>` : ""}
+      ${item.type === "role_resource" && ASSIGNABLE_DASHBOARD_ROLES.includes(item.roleResourceRole) ? `<a class="btn btn-outline btn-compact" href="admin.html?view=resources&amp;role=${encodeURIComponent(item.roleResourceRole)}">Open team resources ↗</a>` : ""}
       ${item.type === "session_available" && item.sessionId ? `<a class="btn btn-outline btn-compact" href="nawras-online.html?session=${encodeURIComponent(item.sessionId)}">Open session ↗</a>` : ""}
+      ${item.type === "academy_calendar_event" ? `<a class="btn btn-outline btn-compact" href="admin.html?view=calendar">Open my calendar ↗</a>` : ""}
       ${item.type === "course_update" ? `<a class="btn btn-outline btn-compact" href="admin.html?view=my-courses">Open my courses ↗</a>` : ""}
-      ${["task_available", "task_submitted"].includes(item.type) ? `<a class="btn btn-outline btn-compact" href="admin.html?view=tasks">Open tasks ↗</a>` : ""}
+      ${["task_available", "task_submitted", "task_review"].includes(item.type) ? `<a class="btn btn-outline btn-compact" href="admin.html?view=${state.member?.teamLeadRoles?.includes(item.taskRole) ? "managed-tasks" : "tasks"}${ASSIGNABLE_DASHBOARD_ROLES.includes(item.taskRole) ? `&amp;role=${encodeURIComponent(item.taskRole)}` : ""}">Open tasks ↗</a>` : ""}
       ${item.type === "dashboard_access" ? `<a class="btn btn-outline btn-compact" href="admin.html">Open dashboard ↗</a>` : ""}
       ${["ratings_update", "ratings_reset"].includes(item.type) ? `<a class="btn btn-outline btn-compact inbox-open-ratings" href="admin.html?rating=mine">View my rating sheet ↗</a>` : ""}
       ${item.read ? "" : `<button class="text-button inbox-mark-read" type="button" data-inbox-read="${escapeAttr(item.id)}">Mark as read</button>`}
@@ -826,14 +1087,51 @@ function renderMemberInbox(items) {
   }));
 }
 
+async function filterInboxSessionNotices(items, uid, generation) {
+  if (state.inboxSessionAccessUid !== uid) {
+    state.inboxSessionAccessUid = uid;
+    state.inboxSessionAccess = new Map();
+  }
+  const accessCache = state.inboxSessionAccess;
+  const memberAtStart = state.member;
+  const sessionNoticeIds = [...new Set(items
+    .filter((item) => ["session_available", "session_cancelled", "attendance_update"].includes(item.type))
+    .map((item) => item.sessionId).filter(Boolean))];
+  for (let offset = 0; offset < sessionNoticeIds.length; offset += 20) {
+    await Promise.all(sessionNoticeIds.slice(offset, offset + 20).map(async (sessionId) => {
+      if (accessCache.has(sessionId)) return;
+      let allowed = false;
+      try {
+        const snapshot = await getDoc(doc(db, "nawrasOnlineSessions", sessionId));
+        allowed = snapshot.exists() && memberAtStart?.uid === uid
+          && (memberAtStart.role === "admin"
+            || isSessionForMember({ ...snapshot.data(), status: "scheduled" }, memberAtStart));
+      } catch (_) {
+        // A denied/missing room must not leave its title or date visible in the inbox.
+      }
+      accessCache.set(sessionId, allowed);
+    }));
+    if (state.inboxFilterGeneration !== generation || state.user?.uid !== uid) return null;
+  }
+  return items.filter((item) => !["session_available", "session_cancelled", "attendance_update"].includes(item.type)
+    || (item.sessionId && accessCache.get(item.sessionId) === true));
+}
+
 async function loadMemberInbox(uid) {
   if (!uid) return;
   if (state.inboxUnsubscribe) state.inboxUnsubscribe();
+  const generation = ++state.inboxFilterGeneration;
+  let snapshotRevision = 0;
   try {
     const inboxQuery = query(collection(db, "teamMembers", uid, "notifications"), orderBy("createdAt", "desc"));
     state.inboxUnsubscribe = onSnapshot(inboxQuery, (snapshot) => {
-      state.inboxMessages = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
-      renderMemberInbox(state.inboxMessages);
+      const revision = ++snapshotRevision;
+      const messages = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+      void filterInboxSessionNotices(messages, uid, generation).then((visible) => {
+        if (!visible || revision !== snapshotRevision || generation !== state.inboxFilterGeneration || state.user?.uid !== uid) return;
+        state.inboxMessages = visible;
+        renderMemberInbox(state.inboxMessages);
+      });
     }, (error) => {
       const list = $("memberInboxList") || $("askerInboxList");
       if (list) list.innerHTML = `<div class="empty-state">Inbox could not be loaded. Check that the latest Firestore rules are deployed.</div>`;
@@ -889,21 +1187,139 @@ async function clearMemberInbox() {
 }
 
 const TASK_ROLE_ORDER = ["admin", "user", "leaders", "public", "tech", "social", "designers", "content", "event"];
+const POSITION_LEADER_TASK_AUDIENCE = "position_leaders";
 const TASK_MODE_LABELS = {
   all: "Compulsory for everyone",
   first: "First submission wins",
   free: "Open to the team"
 };
 
+function taskLeaderUniversityTag(member = state.member) {
+  const explicit = String(member?.leadingUniversityTag || "").trim();
+  if (universityByTag(explicit)) return explicit;
+  const assigned = String(member?.universityTag || "").trim();
+  return universityByTag(assigned) ? assigned : "";
+}
+
+function canManageTasksForRole(roleKey) {
+  return state.role === "admin"
+    || (roleKey !== POSITION_LEADER_TASK_AUDIENCE && currentTeamLeadRoles().includes(roleKey))
+    || (roleKey !== POSITION_LEADER_TASK_AUDIENCE && hasDashboardAccess("tasksManage")
+      && (roleKey === state.role || currentTeamLeadRoles().includes(roleKey)));
+}
+
+function canAssignTasksAcrossRoles() {
+  return state.role === "admin" || state.role === "leaders" || hasDashboardAccess("tasksManage");
+}
+
+function canCreateTaskForRole(roleKey) {
+  if (state.role === "admin") return true;
+  if (state.role === "leaders") {
+    const universityScope = Boolean(taskLeaderUniversityTag())
+      && ![POSITION_LEADER_TASK_AUDIENCE, "admin"].includes(roleKey)
+      && ASSIGNABLE_DASHBOARD_ROLES.includes(roleKey);
+    const appointedPositionScope = currentTeamLeadRoles().includes(roleKey)
+      && ![POSITION_LEADER_TASK_AUDIENCE, "admin"].includes(roleKey);
+    return universityScope || appointedPositionScope;
+  }
+  if (hasDashboardAccess("tasksManage") && (roleKey === state.role || currentTeamLeadRoles().includes(roleKey))) {
+    return roleKey !== POSITION_LEADER_TASK_AUDIENCE;
+  }
+  return currentTeamLeadRoles().includes(roleKey);
+}
+
+function canCreateAnyTask() {
+  if (state.role === "admin" || state.role === "leaders") return true;
+  return currentTeamLeadRoles().some((roleKey) => canCreateTaskForRole(roleKey))
+    || (hasDashboardAccess("tasksManage") && canCreateTaskForRole(state.role));
+}
+
+function canManageTask(task) {
+  return Boolean(task && (
+    state.role === "admin"
+    || (canManageTasksForRole(task.targetRole)
+      && (state.role !== "leaders"
+        || !taskLeaderUniversityTag()
+        || String(task.targetUniversityTag || "") === taskLeaderUniversityTag()))
+    || (state.role === "leaders"
+      && task.createdBy === state.user?.uid
+      && task.targetUniversityTag === taskLeaderUniversityTag())
+  ));
+}
+
+function taskMatchesAudience(task, member = state.member, uid = state.user?.uid) {
+  if (!task || !member || !uid || member.active === false) return false;
+  const taskRole = task.targetRole;
+  const roleMatches = taskRole === POSITION_LEADER_TASK_AUDIENCE
+    ? isPositionLeader(member)
+    : member.role === taskRole
+      || (member.role === "admin" && (
+        taskRole === "admin" || adminTeamAssignment(member)?.role === taskRole
+      ));
+  const universityTag = String(task.targetUniversityTag || "");
+  const universityMatches = !universityTag || member.universityTag === universityTag;
+  const assigned = Array.isArray(task.assignedMemberUids) ? task.assignedMemberUids : [];
+  return roleMatches && universityMatches && (!assigned.length || assigned.includes(uid));
+}
+
+function taskUniversityScopeForCurrentUser() {
+  return state.role === "leaders" ? taskLeaderUniversityTag() : "";
+}
+
+function taskMemberChoices(roleKey, universityTag) {
+  return state.teamMembers
+    .filter((member) => member.active !== false)
+    .filter((member) => roleKey === POSITION_LEADER_TASK_AUDIENCE
+      ? isPositionLeader(member)
+      : member.role === roleKey
+        || (member.role === "admin" && (roleKey === "admin" || adminTeamAssignment(member)?.role === roleKey)))
+    .filter((member) => !universityTag || member.universityTag === universityTag)
+    .sort((a, b) => memberDisplayName(a).localeCompare(memberDisplayName(b)));
+}
+
+function refreshTaskMemberSelector(selectedUids = null) {
+  const roleKey = $("taskTargetRole")?.value || "";
+  const universityTag = $("taskTargetUniversity")?.value || "";
+  const select = $("taskAssignedMembers");
+  const search = $("taskMemberSearch");
+  if (!select) return;
+  if (selectedUids !== null) taskSelectedMemberUids = new Set(selectedUids);
+  const selected = [...taskSelectedMemberUids];
+  const term = String(search?.value || "").trim().toLocaleLowerCase();
+  const members = taskMemberChoices(roleKey, universityTag).filter((member) =>
+    !term || memberDisplayName(member).toLocaleLowerCase().includes(term)
+      || String(member.email || "").toLocaleLowerCase().includes(term));
+  select.innerHTML = members.length
+    ? members.map((member) => `<label class="task-assignee-option"><input type="checkbox" value="${escapeAttr(member.uid)}" ${selected.includes(member.uid) ? "checked" : ""}><span><strong>${escapeHtml(memberDisplayName(member))}</strong><small>${escapeHtml(ROLE_CONFIG[member.role]?.label || member.role)}${member.universityTag ? ` · ${escapeHtml(universityLabel(member.universityTag))}` : ""}</small></span></label>`).join("")
+    : `<p class="task-assignee-empty">No eligible people found for this team and university.</p>`;
+}
+
+function taskDashboardRole() {
+  const activeRole = state.activeDashboardRole;
+  if (canCreateTaskForRole(activeRole)) return activeRole;
+  if (state.role === "leaders" && canCreateTaskForRole("leaders")) return "leaders";
+  return currentTeamLeadRoles().find((role) => canCreateTaskForRole(role)) || state.role;
+}
+
 function taskTargetRole(task) {
+  if (task?.targetRole === POSITION_LEADER_TASK_AUDIENCE) return "Position leaders";
+  if (task?.targetRole === "leaders") return "Leaders account role";
   return ROLE_CONFIG[task?.targetRole]?.label || task?.targetRole || "Team";
 }
 
+function taskTargetLabel(task) {
+  const label = taskTargetRole(task);
+  return ["leaders", POSITION_LEADER_TASK_AUDIENCE].includes(task?.targetRole) ? label : `${label} team`;
+}
+
+function isPositionLeader(member) {
+  const roles = Array.isArray(member?.teamLeadRoles) ? member.teamLeadRoles : [];
+  return roles.some((role) => ASSIGNABLE_DASHBOARD_ROLES.includes(role))
+    || adminTeamAssignment(member)?.position === "leader";
+}
+
 function canSubmitTaskAsCurrentUser(task) {
-  if (!task) return false;
-  if (state.role !== "admin") return task.targetRole === state.role;
-  if (task.targetRole === "admin") return true;
-  return adminTeamAssignment(state.member)?.role === task.targetRole;
+  return taskMatchesAudience(task);
 }
 
 function taskModeLabel(mode) {
@@ -914,21 +1330,67 @@ async function loadTasks() {
   if (!state.isTeam || !refs.tasksList) return;
   try {
     const base = collection(db, "tasks");
-    let snapshot;
+    let snapshots;
+    let migratedTaskFields = {};
     if (state.role === "admin") {
       try {
-        snapshot = await getDocs(query(base, orderBy("createdAt", "desc")));
+        snapshots = [await getDocs(query(base, orderBy("createdAt", "desc")))];
       } catch (_) {
-        snapshot = await getDocs(base);
+        snapshots = [await getDocs(base)];
       }
+      migratedTaskFields = await migrateLegacyTaskAudiences(snapshots.flatMap((snapshot) => snapshot.docs));
     } else {
-      try {
-        snapshot = await getDocs(query(base, where("targetRole", "==", state.role), orderBy("createdAt", "desc")));
-      } catch (_) {
-        snapshot = await getDocs(query(base, where("targetRole", "==", state.role)));
+      const taskQueries = [];
+      const personalRoles = [...new Set([
+        state.role,
+        ...(isPositionLeader(state.member) ? [POSITION_LEADER_TASK_AUDIENCE] : [])
+      ])];
+      const universityTags = [...new Set([
+        "", String(state.member?.universityTag || ""),
+        ...(state.role === "leaders" ? [taskLeaderUniversityTag()] : [])
+      ])];
+      for (const roleKey of personalRoles) {
+        for (const universityTag of universityTags) {
+          for (const audienceFilter of [
+            [{ field: "audienceMode", op: "==", value: "all" }]
+          ]) {
+            taskQueries.push(getDocs(query(base,
+              where("targetRole", "==", roleKey),
+              where("targetUniversityTag", "==", universityTag),
+              ...audienceFilter.map((filter) => where(filter.field, filter.op, filter.value))
+            )));
+          }
+        }
       }
+      for (const roleKey of currentTeamLeadRoles()) {
+        const filters = [where("targetRole", "==", roleKey)];
+        const leaderUniversity = state.role === "leaders"
+          ? taskLeaderUniversityTag()
+          : "";
+        if (leaderUniversity) filters.push(where("targetUniversityTag", "==", leaderUniversity));
+        taskQueries.push(getDocs(query(base, ...filters)));
+      }
+      if (state.role === "leaders") {
+        const createdTasksQuery = query(base,
+          where("createdBy", "==", state.user.uid),
+          where("targetUniversityTag", "==", taskLeaderUniversityTag()));
+        taskQueries.push(getDocs(createdTasksQuery));
+      }
+      snapshots = await Promise.all(taskQueries);
+      const assignmentSnapshot = await getDocs(collection(db, "teamMembers", state.user.uid, "taskAssignments"));
+      const individuallyAssignedTasks = await Promise.all(assignmentSnapshot.docs.map(async (assignment) => {
+        try {
+          const taskSnapshot = await getDoc(doc(db, "tasks", assignment.id));
+          return taskSnapshot.exists() ? { id: taskSnapshot.id, data: () => taskSnapshot.data() } : null;
+        } catch (_) { return null; }
+      }));
+      snapshots.push({ docs: individuallyAssignedTasks.filter(Boolean) });
     }
-    state.tasks = snapshot.docs.map((item) => ({ id: item.id, ...item.data() })).sort(sortByCreatedDesc);
+    const taskById = new Map();
+    snapshots.flatMap((snapshot) => snapshot.docs).forEach((item) => taskById.set(item.id, {
+      id: item.id, ...item.data(), ...(migratedTaskFields[item.id] || {})
+    }));
+    state.tasks = [...taskById.values()].sort(sortByCreatedDesc);
     const tasksForMe = state.tasks.filter(canSubmitTaskAsCurrentUser);
     const submissions = await Promise.all(tasksForMe.map(async (task) => {
       const submission = await getDoc(doc(db, "tasks", task.id, "submissions", state.user.uid));
@@ -942,53 +1404,154 @@ async function loadTasks() {
   }
 }
 
+async function migrateLegacyTaskAudiences(taskDocs) {
+  const legacyDocs = taskDocs.filter((item) => {
+    const data = item.data();
+    return !Object.prototype.hasOwnProperty.call(data, "targetUniversityTag")
+      || !Object.prototype.hasOwnProperty.call(data, "assignedMemberUids")
+      || !Object.prototype.hasOwnProperty.call(data, "audienceMode");
+  });
+  if (!legacyDocs.length) return {};
+  const creatorUids = [...new Set(legacyDocs.map((item) => item.data().createdBy).filter(Boolean))];
+  const creatorProfiles = new Map();
+  await Promise.all(creatorUids.map(async (uid) => {
+    try {
+      const profile = await getDoc(doc(db, "teamMembers", uid));
+      if (profile.exists()) creatorProfiles.set(uid, profile.data());
+    } catch (_) {}
+  }));
+  const migrated = {};
+  for (let offset = 0; offset < legacyDocs.length; offset += 10) {
+    const batch = writeBatch(db);
+    const chunk = legacyDocs.slice(offset, offset + 10);
+    for (const item of chunk) {
+      const data = item.data();
+      const assignedMemberUids = Array.isArray(data.assignedMemberUids) ? data.assignedMemberUids : [];
+      const creator = creatorProfiles.get(data.createdBy);
+      const targetUniversityTag = Object.prototype.hasOwnProperty.call(data, "targetUniversityTag")
+        ? data.targetUniversityTag
+        : creator?.role === "leaders" ? taskLeaderUniversityTag(creator) : "";
+      const values = {
+        targetUniversityTag,
+        assignedMemberUids,
+        audienceMode: assignedMemberUids.length ? "selected" : "all",
+        updatedAt: serverTimestamp()
+      };
+      migrated[item.id] = { ...values, updatedAt: data.updatedAt };
+      batch.update(doc(db, "tasks", item.id), values);
+    }
+    await batch.commit();
+  }
+  for (const item of legacyDocs) {
+    const assigned = migrated[item.id]?.assignedMemberUids || [];
+    if (assigned.length) await syncTaskRecipientAssignments(item.id, [], assigned);
+  }
+  return migrated;
+}
+
 function renderTasks() {
   personalPlanner?.refreshOverview();
   if (!refs.tasksList) return;
+  const canViewAllTasks = state.role === "admin";
   const isAdmin = state.role === "admin";
-  if (refs.tasksPanelTitle) refs.tasksPanelTitle.textContent = isAdmin ? "Task command center" : `${ROLE_CONFIG[state.role]?.label || "Team"} tasks`;
+  const viewRole = taskDashboardRole();
+  const isRoleLeader = state.role !== "admin" && (canManageTasksForRole(viewRole) || state.role === "leaders");
+  const canManageCurrentTeam = canManageTasksForRole(viewRole);
+  const leaderNeedsAssignment = state.role === "leaders"
+    && !taskLeaderUniversityTag()
+    && !currentTeamLeadRoles().length;
+  const teamLabel = ROLE_CONFIG[viewRole]?.label || ROLE_CONFIG[state.role]?.label || "Team";
+  const isUniversityLeaderBoard = state.role === "leaders" && viewRole === "leaders";
+  if (refs.tasksPanelTitle) refs.tasksPanelTitle.textContent = isAdmin ? "Task command center" : isUniversityLeaderBoard ? "Leaders task board" : isRoleLeader ? `${teamLabel} team tasks` : `${ROLE_CONFIG[state.role]?.label || "Team"} tasks`;
   if (refs.tasksPanelHint) refs.tasksPanelHint.textContent = isAdmin
     ? "Assign work, set XP, and review submissions."
-    : "Complete a task to earn its XP reward.";
-  if ($("addTaskBtn")) $("addTaskBtn").classList.toggle("hidden", !isAdmin);
+    : leaderNeedsAssignment
+      ? "An admin must assign your university or a position team before you can create or manage tasks."
+    : isUniversityLeaderBoard
+      ? "Create role-based tasks and review submissions for tasks you assigned."
+    : isRoleLeader
+      ? `Assign tasks to ${teamLabel}, review submissions, and award XP.`
+      : "Complete a task to earn its XP reward.";
+  if ($("addTaskBtn")) {
+    $("addTaskBtn").classList.toggle("hidden", !canCreateAnyTask());
+    $("addTaskBtn").disabled = leaderNeedsAssignment;
+    $("addTaskBtn").title = leaderNeedsAssignment
+      ? "An admin must assign you a university or position team first."
+      : "";
+  }
 
-  if (!state.tasks.length) {
-    refs.tasksList.innerHTML = `<div class="empty-state">${isAdmin ? "No tasks yet. Assign the first team task above." : "No tasks have been assigned to your team yet."}</div>`;
+  const ownTasks = state.tasks.filter((task) => canSubmitTaskAsCurrentUser(task)
+    && (task.status === "open" || state.taskSubmissions[task.id]));
+  const managedTasks = state.tasks.filter((task) => canManageTask(task)
+    && (canViewAllTasks || task.targetRole === viewRole || (state.role === "leaders" && task.createdBy === state.user?.uid)));
+  if (!state.tasks.length || (!canViewAllTasks && !managedTasks.length && !ownTasks.length)) {
+    refs.tasksList.innerHTML = `<div class="empty-state">${canCreateTaskForRole(viewRole) ? `No ${escapeHtml(teamLabel)} tasks yet. Assign the first one above.` : "No tasks have been assigned to your team yet."}</div>`;
     if (refs.taskSubmissionsViewer) refs.taskSubmissionsViewer.classList.add("hidden");
     return;
   }
-  if (isAdmin) {
-    const ownTasks = state.tasks.filter((task) => canSubmitTaskAsCurrentUser(task)
-      && (task.status === "open" || state.taskSubmissions[task.id]));
-    refs.tasksList.innerHTML = `<section class="admin-task-work-section"><div class="admin-task-section-heading"><div><span class="panel-kicker">Your work</span><h3>Tasks I can complete</h3></div><span class="panel-hint">Admin tasks${adminTeamAssignment(state.member) ? ` and ${escapeHtml(ROLE_CONFIG[adminTeamAssignment(state.member).role].label)} team tasks` : ""} · XP after review</span></div>${ownTasks.length ? ownTasks.map(memberTaskCard).join("") : `<div class="empty-state">No open tasks are assigned to your Admin account${adminTeamAssignment(state.member) ? ` or your ${escapeHtml(ROLE_CONFIG[adminTeamAssignment(state.member).role].label)} team` : ""} yet.</div>`}</section><section class="admin-task-work-section"><div class="admin-task-section-heading"><div><span class="panel-kicker">Management</span><h3>Task command center</h3></div><span class="panel-hint">Assign work, set XP, and review submissions.</span></div><div class="task-list">${state.tasks.map(adminTaskCard).join("")}</div></section>`;
+  if (canViewAllTasks) {
+    refs.tasksList.innerHTML = `${ownTaskGroupsMarkup(ownTasks)}<section class="admin-task-work-section"><div class="admin-task-section-heading"><div><span class="panel-kicker">Management</span><h3>Task command center</h3></div><span class="panel-hint">Assign work, set XP, and review submissions.</span></div><div class="task-list">${state.tasks.map(adminTaskCard).join("")}</div></section>`;
+  } else if (isRoleLeader) {
+    refs.tasksList.innerHTML = `${ownTaskGroupsMarkup(ownTasks)}<section class="admin-task-work-section"><div class="admin-task-section-heading"><div><span class="panel-kicker">Team management</span><h3>${escapeHtml(teamLabel)} team tasks</h3></div><span class="panel-hint">Review member work and award XP when it meets the task requirements.</span></div>${managedTasks.length ? `<div class="task-list">${managedTasks.map(adminTaskCard).join("")}</div>` : `<div class="empty-state">No tasks have been assigned to this team yet.</div>`}</section>`;
   } else {
-    refs.tasksList.innerHTML = state.tasks.map(memberTaskCard).join("");
+    refs.tasksList.innerHTML = ownTaskGroupsMarkup(ownTasks);
   }
-  refs.tasksList.querySelectorAll("[data-preview-task]").forEach((button) => button.addEventListener("click", () => openTaskGame(button.dataset.previewTask, true)));
-  refs.tasksList.querySelectorAll("[data-view-task]").forEach((button) => button.addEventListener("click", () => viewTaskSubmissions(button.dataset.viewTask)));
-  refs.tasksList.querySelectorAll("[data-play-task]").forEach((button) => button.addEventListener("click", () => openTaskGame(button.dataset.playTask)));
-  refs.tasksList.querySelectorAll("[data-close-task]").forEach((button) => button.addEventListener("click", () => closeTask(button.dataset.closeTask)));
-  refs.tasksList.querySelectorAll("[data-delete-task]").forEach((button) => button.addEventListener("click", () => deleteTask(button.dataset.deleteTask)));
-  refs.tasksList.querySelectorAll("[data-submit-task]").forEach((form) => form.addEventListener("submit", (event) => {
-    event.preventDefault();
-    submitTask(form.dataset.submitTask);
-  }));
-  bindLinkEditors(refs.tasksList);
+  hydrateTaskCoverImages(refs.tasksList);
+}
+
+function ownTaskGroupsMarkup(tasks) {
+  if (!tasks.length) return `<div class="empty-state">No open tasks are assigned to you right now.</div>`;
+  const groups = [
+    { key: POSITION_LEADER_TASK_AUDIENCE, title: "Position-leader assignments", hint: "Assigned by admins to appointed team leaders. Admins review these submissions." },
+    { key: "leaders", title: "Leaders-role assignments", hint: "For the Leaders account-role team, separate from team-leader appointments." },
+    { key: "other", title: "Your role tasks", hint: "Tasks assigned to your account role or your assigned Admin team." }
+  ];
+  return groups.map((group) => {
+    const items = tasks.filter((task) => group.key === "other"
+      ? !["leaders", POSITION_LEADER_TASK_AUDIENCE].includes(task.targetRole)
+      : task.targetRole === group.key);
+    return items.length ? `<section class="admin-task-work-section"><div class="admin-task-section-heading"><div><span class="panel-kicker">Your work</span><h3>${group.title}</h3></div><span class="panel-hint">${group.hint}</span></div><div class="task-list">${items.map(taskSummaryCard).join("")}</div></section>` : "";
+  }).join("");
 }
 
 function adminTaskCard(task) {
-  const status = task.status === "open" ? "Open" : "Closed";
-  const count = Number(task.submissionCount) || 0;
-  return `<article class="task-card task-admin-card">
-    <div class="task-card-top"><div><span class="card-tag">${escapeHtml(taskTargetRole(task))} team</span><span class="task-status ${task.status === "open" ? "is-open" : "is-closed"}">${status}</span></div><strong class="task-xp">+${Number(task.xp) || 0} XP</strong></div>
-    <h3>${escapeHtml(task.title)}</h3><p>${escapeHtml(task.description)}</p>
-    ${taskAssetsMarkup(task)}
-    <div class="task-card-meta"><span>${escapeHtml(taskModeLabel(task.mode))}</span>${taskHasGame(task) ? `<span>Interactive page</span>` : ""}<span>${count} submission${count === 1 ? "" : "s"}</span><span>${escapeHtml(formatDate(task.createdAt))}</span></div>
-    <div class="task-card-actions">${taskHasGame(task) ? `<button type="button" class="btn btn-outline btn-compact" data-preview-task="${escapeAttr(task.id)}">Preview page</button>` : ""}<button type="button" class="btn btn-secondary btn-compact" data-view-task="${escapeAttr(task.id)}">View submissions</button>${task.status === "open" ? `<button type="button" class="btn btn-outline btn-compact" data-close-task="${escapeAttr(task.id)}">Close task</button>` : ""}<button type="button" class="btn btn-danger btn-compact" data-delete-task="${escapeAttr(task.id)}">Delete</button></div>
+  return taskSummaryCard(task);
+}
+
+function taskBriefExcerpt(description, maxLength = 130) {
+  const brief = String(description || "").replace(/\s+/g, " ").trim();
+  if (!brief) return "Open the task to see the full instructions.";
+  if (brief.length <= maxLength) return brief;
+  const shortened = brief.slice(0, maxLength);
+  const lastSpace = shortened.lastIndexOf(" ");
+  return `${shortened.slice(0, lastSpace > maxLength * 0.65 ? lastSpace : maxLength).trimEnd()}…`;
+}
+
+function taskSummaryCard(task) {
+  const submission = state.taskSubmissions[task.id];
+  const submittedLabel = submission
+    ? (submission.status === "approved" ? "Approved" : submission.status === "rejected" ? "Needs changes" : "Submitted")
+    : task.status === "open" ? "Open" : "Closed";
+  const submittedClass = submission ? "is-submitted" : task.status === "open" ? "is-open" : "is-closed";
+  const taskMeta = [
+    escapeHtml(taskTargetLabel(task)),
+    escapeHtml(taskModeLabel(task.mode)),
+    task.dueAt ? `Due ${escapeHtml(formatDate(task.dueAt))}` : ""
+  ].filter(Boolean);
+  return `<article class="content-card task-preview-card" data-open-task-card="${escapeAttr(task.id)}" tabindex="0" role="button" aria-label="${escapeAttr(`Open task: ${task.title || ""}`)}">
+    ${taskCoverMarkup(task)}
+    <div class="content-card-body">
+      <div class="task-preview-top"><span class="task-status ${submittedClass}">${escapeHtml(submittedLabel)}</span><strong class="task-preview-xp">+${Number(task.xp) || 0} XP</strong></div>
+      <h3>${escapeHtml(task.title)}</h3>
+      <p class="task-preview-excerpt">${escapeHtml(taskBriefExcerpt(task.description))}</p>
+      ${taskAssignedByMarkup(task)}
+      <div class="task-preview-meta">${taskMeta.map((item) => `<span>${item}</span>`).join("")}</div>
+      <div class="card-footer task-preview-footer"><span class="muted">Open task details</span><span class="card-arrow" aria-hidden="true">${materialIcon("arrow_forward")}</span></div>
+    </div>
   </article>`;
 }
 
-function memberTaskCard(task) {
+function memberTaskSubmissionMarkup(task) {
   const submission = state.taskSubmissions[task.id];
   const locked = task.status !== "open";
   let body;
@@ -996,7 +1559,7 @@ function memberTaskCard(task) {
     const reviewStatus = submission.status || (Number(submission.xpAwarded) > 0 ? "approved" : "pending");
     const isApproved = reviewStatus === "approved";
     const isRejected = reviewStatus === "rejected";
-    body = `<div class="task-complete ${isRejected ? "task-rejected" : isApproved ? "" : "task-pending"}"><span class="task-complete-mark">${materialIcon(isApproved ? "task_alt" : isRejected ? "error" : "hourglass_top")}</span><div><strong>${isApproved ? "Approved" : isRejected ? "Needs changes" : "Awaiting admin review"}</strong><p>${escapeHtml(formatDate(submission.submittedAt))} · ${isApproved ? `You earned +${Number(submission.xpAwarded) || 0} XP.` : isRejected ? "No XP was awarded for this submission." : "The task stays open while an admin reviews submissions."}</p></div></div>`;
+    body = `<div class="task-complete ${isRejected ? "task-rejected" : isApproved ? "" : "task-pending"}"><span class="task-complete-mark">${materialIcon(isApproved ? "task_alt" : isRejected ? "error" : "hourglass_top")}</span><div><strong>${isApproved ? "Approved" : isRejected ? "Needs changes" : "Awaiting review"}</strong><p>${escapeHtml(formatDate(submission.submittedAt))} · ${isApproved ? `You earned +${Number(submission.xpAwarded) || 0} XP.` : isRejected ? "No XP was awarded for this submission." : "The task stays open while a team lead or admin reviews submissions."}</p></div></div>`;
   } else if (locked) {
     body = `<div class="task-locked"><span>◌</span><div><strong>Task closed</strong><p>This task is no longer accepting submissions.</p></div></div>`;
   } else if (taskHasGame(task)) {
@@ -1004,7 +1567,157 @@ function memberTaskCard(task) {
   } else {
     body = `<form class="task-submit-form" data-submit-task="${escapeAttr(task.id)}"><label>Your submission<textarea id="task-text-${escapeAttr(task.id)}" rows="4" maxlength="3000" placeholder="Describe what you completed…" required></textarea></label>${linkEditorMarkup("task", task.id, "Add supporting link", "Attach up to 3 labeled links to your submission.")}<button class="btn btn-primary btn-compact" type="submit">Submit task <span>→</span></button></form>`;
   }
-  return `<article class="task-card task-member-card"><div class="task-card-top"><div><span class="card-tag">${escapeHtml(taskModeLabel(task.mode))}</span><span class="task-status ${task.status === "open" ? "is-open" : "is-closed"}">${task.status === "open" ? "Open for submissions" : "Closed"}</span></div><strong class="task-xp">Up to +${Number(task.xp) || 0} XP</strong></div><h3>${escapeHtml(task.title)}</h3><p>${escapeHtml(task.description)}</p>${taskAssetsMarkup(task)}<div class="task-card-meta"><span>${escapeHtml(taskTargetRole(task))} team</span><span>${Number(task.submissionCount) || 0} submitted</span><span>XP after review</span></div>${body}</article>`;
+  return body;
+}
+
+function taskCoverMarkup(task, size = "card") {
+  const imageUrl = normalizePhotoUrl(task?.imageUrl);
+  const driveFileId = String(task?.coverDriveFileId || "");
+  const hasCover = Boolean(imageUrl || driveFileId);
+  const className = size === "detail" ? "task-details-cover" : "content-card-media task-preview-media";
+  return `<div class="${className}${hasCover ? "" : " is-placeholder"}"><div class="image-placeholder task-cover-placeholder" aria-hidden="true">${materialIcon("task_alt")}</div>${hasCover ? `<img class="task-cover-image" data-task-cover-image data-task-id="${escapeAttr(task.id)}" data-task-cover-file="${escapeAttr(driveFileId)}" data-task-cover-url="${escapeAttr(imageUrl)}" alt="${escapeAttr(task.title || "Task cover")}" loading="lazy" referrerpolicy="no-referrer" hidden>` : ""}</div>`;
+}
+
+function taskAssignedByMarkup(task) {
+  const member = state.teamMembers.find((item) => item.uid === task?.createdBy) || {};
+  const name = String(task?.createdByName || (member.uid ? memberDisplayName(member) : "NAWRAS EDU team")).trim();
+  const creatorProfile = {
+    ...member,
+    uid: task?.createdBy || member.uid || "",
+    displayName: name,
+    photoURL: task?.createdByPhotoURL || member.photoURL || ""
+  };
+  return `<div class="task-assigned-by">${profileAvatarMarkup(creatorProfile, "small")}<span class="task-assigned-by-copy"><small>Assigned by</small><strong>${escapeHtml(name)}</strong></span></div>`;
+}
+
+function hydrateTaskCoverImages(root) {
+  root?.querySelectorAll("img[data-task-cover-image]").forEach((image) => {
+    const showImage = () => {
+      image.hidden = false;
+      image.closest(".task-preview-media, .task-details-cover")?.classList.add("has-photo");
+    };
+    image.addEventListener("load", showImage, { once: true });
+    image.addEventListener("error", () => { image.hidden = true; }, { once: true });
+    const externalUrl = normalizePhotoUrl(image.dataset.taskCoverUrl || "");
+    if (externalUrl) {
+      image.src = externalUrl;
+      return;
+    }
+    const taskId = image.dataset.taskId;
+    const fileId = image.dataset.taskCoverFile;
+    if (!taskId || !fileId) return;
+    const cacheKey = `${taskId}:${fileId}`;
+    const cached = taskCoverPreviewCache.get(cacheKey);
+    if (cached?.url && cached.expiresAt > Date.now()) {
+      image.src = cached.url;
+      return;
+    }
+    if (cached?.promise && cached.expiresAt > Date.now()) {
+      cached.promise.then((url) => { if (url && image.isConnected) image.src = url; });
+      return;
+    }
+    const request = requestDrivePreviewTicket(auth, "taskCover", taskId, fileId)
+      .then((ticket) => {
+        taskCoverPreviewCache.set(cacheKey, { url: ticket.url, expiresAt: Date.now() + 50 * 60 * 1000 });
+        return ticket.url;
+      })
+      .catch(() => {
+        taskCoverPreviewCache.delete(cacheKey);
+        return "";
+      });
+    taskCoverPreviewCache.set(cacheKey, { promise: request, expiresAt: Date.now() + 50 * 60 * 1000 });
+    request.then((url) => { if (url && image.isConnected) image.src = url; });
+  });
+}
+
+function ensureTaskDetailsModal() {
+  let modal = $("taskDetailsModal");
+  if (!modal) {
+    modal = document.createElement("div");
+    modal.id = "taskDetailsModal";
+    modal.className = "modal hidden task-preview-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.innerHTML = `<div class="modal-backdrop" data-close-modal="taskDetailsModal"></div><div class="modal-card task-details-modal"><button class="modal-close" type="button" data-close-modal="taskDetailsModal" aria-label="Close task details">×</button><div id="taskDetailsContent"></div></div>`;
+    document.body.appendChild(modal);
+  }
+  return { modal, details: $("taskDetailsContent") };
+}
+
+function openTaskDetails(id) {
+  const task = state.tasks.find((item) => item.id === id);
+  if (!task) return;
+  const { modal, details } = ensureTaskDetailsModal();
+  if (!details) return;
+  const canManage = canManageTask(task);
+  const canSubmit = canSubmitTaskAsCurrentUser(task);
+  const hasSubmission = Boolean(state.taskSubmissions[task.id]);
+  const submitCta = canSubmit && task.status === "open" && !hasSubmission
+    ? taskHasGame(task)
+      ? `<button type="button" class="btn btn-primary task-details-primary-action" data-play-task="${escapeAttr(task.id)}">${materialIcon("play_arrow")} Start task</button>`
+      : `<button type="button" class="btn btn-primary task-details-primary-action" data-jump-submit>${materialIcon("send")} Submit task</button>`
+    : "";
+  const managerActions = canManage ? `
+    <div class="task-details-actions">
+      <button type="button" class="btn btn-primary" data-edit-task="${escapeAttr(task.id)}">${materialIcon("edit")} Edit task</button>
+      ${taskHasGame(task) ? `<button type="button" class="btn btn-outline" data-preview-task="${escapeAttr(task.id)}">${materialIcon("visibility")} Preview activity</button>` : ""}
+      <button type="button" class="btn btn-secondary" data-view-task="${escapeAttr(task.id)}">${materialIcon("fact_check")} View submissions <span>${Number(task.submissionCount) || 0}</span></button>
+      ${task.status === "open" ? `<button type="button" class="btn btn-outline" data-close-task="${escapeAttr(task.id)}">${materialIcon("lock")} Close task</button>` : ""}
+      <button type="button" class="btn btn-danger" data-delete-task="${escapeAttr(task.id)}">${materialIcon("delete")} Delete task</button>
+    </div>` : "";
+  const memberSubmission = canSubmit ? memberTaskSubmissionMarkup(task) : "";
+  const assets = taskAssetsMarkup(task);
+  const detailsMeta = [
+    `<span>${escapeHtml(taskTargetLabel(task))}</span>`,
+    `<span>${escapeHtml(taskModeLabel(task.mode))}</span>`,
+    `<span>Up to +${Number(task.xp) || 0} XP</span>`,
+    `<span>${Number(task.submissionCount) || 0} submission${Number(task.submissionCount) === 1 ? "" : "s"}</span>`,
+    task.dueAt ? `<span>Due ${escapeHtml(formatDate(task.dueAt))}</span>` : ""
+  ].filter(Boolean).join("");
+  details.innerHTML = `<div class="task-details-shell">
+    <section class="task-details-hero">
+      ${taskCoverMarkup(task, "detail")}
+      <div class="task-details-intro">
+        <div class="task-details-kickers"><span class="card-tag">${escapeHtml(taskTargetLabel(task))}</span><span class="task-status ${task.status === "open" ? "is-open" : "is-closed"}">${task.status === "open" ? "Open task" : "Closed task"}</span></div>
+        <h2 id="taskDetailsTitle">${escapeHtml(task.title)}</h2>
+        <div class="task-details-byline">${taskAssignedByMarkup(task)}</div>
+        <div class="task-details-meta">${detailsMeta}</div>
+        ${submitCta}
+      </div>
+    </section>
+    <div class="task-details-content">
+      <section class="task-details-section"><span class="panel-kicker">TASK BRIEF</span><h3>What to do</h3><p class="task-details-description">${escapeHtml(task.description || "No additional instructions were added.")}</p></section>
+      ${assets ? `<section class="task-details-section"><span class="panel-kicker">ATTACHMENTS</span><h3>Task assets</h3>${assets}</section>` : `<section class="task-details-empty"><span class="task-details-empty-icon">${materialIcon("attach_file")}</span><div><strong>No extra assets</strong><p>There are no files or links attached to this task.</p></div></section>`}
+      ${memberSubmission ? `<section class="task-details-section"><span class="panel-kicker">YOUR SUBMISSION</span><h3>Complete this task</h3>${memberSubmission}</section>` : ""}
+      ${managerActions}
+    </div>
+  </div>`;
+  modal.setAttribute("aria-labelledby", "taskDetailsTitle");
+  const closeAnd = (callback) => {
+    closeModal("taskDetailsModal");
+    callback();
+  };
+  details.querySelector("[data-edit-task]")?.addEventListener("click", () => closeAnd(() => openTaskEditor(task.id)));
+  details.querySelector("[data-view-task]")?.addEventListener("click", () => closeAnd(() => viewTaskSubmissions(task.id)));
+  details.querySelector("[data-preview-task]")?.addEventListener("click", () => closeAnd(() => openTaskGame(task.id, true)));
+  details.querySelectorAll("[data-play-task]").forEach((button) =>
+    button.addEventListener("click", () => closeAnd(() => openTaskGame(task.id))));
+  details.querySelector("[data-jump-submit]")?.addEventListener("click", () => {
+    const form = details.querySelector("[data-submit-task]");
+    form?.scrollIntoView({ behavior: "smooth", block: "center" });
+    form?.querySelector("textarea")?.focus({ preventScroll: true });
+  });
+  details.querySelector("[data-close-task]")?.addEventListener("click", () => closeAnd(() => closeTask(task.id)));
+  details.querySelector("[data-delete-task]")?.addEventListener("click", () => closeAnd(() => deleteTask(task.id)));
+  details.querySelector("[data-submit-task]")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void submitTask(task.id).then((submitted) => {
+      if (submitted) closeModal("taskDetailsModal");
+    });
+  });
+  bindLinkEditors(details);
+  hydrateTaskCoverImages(details);
+  openModal("taskDetailsModal");
 }
 
 const MAX_TASK_ASSETS = 6;
@@ -1056,6 +1769,8 @@ function updateTaskGameHtmlSize() {
 }
 
 function setupTaskExtraFields() {
+  if (!$("taskDueAt")) $("taskDescription")?.closest("label")?.insertAdjacentHTML("afterend",
+    '<label>Deadline (optional)<input id="taskDueAt" type="datetime-local"><small>Times use your device timezone. Leave blank if there is no deadline.</small></label>');
   bindLinkEditors($("taskForm"));
   $("taskGameType")?.addEventListener("change", toggleTaskGameFields);
   $("taskGameHtml")?.addEventListener("input", updateTaskGameHtmlSize);
@@ -1083,16 +1798,139 @@ function setupTaskExtraFields() {
   window.addEventListener("message", handleTaskGameMessage);
 }
 
-function openTaskEditor() {
-  if (state.role !== "admin" || !$("taskForm")) return;
+function taskAssignmentLocked(task) {
+  return Boolean(task && (Number(task.submissionCount) > 0 || task.claimedByUid || task.status !== "open"));
+}
+
+let taskImagePreviewUrl = "";
+const taskCoverPreviewCache = new Map();
+
+function previewTaskCoverSelection() {
+  const file = $("taskImageFile")?.files?.[0];
+  const preview = $("taskImagePreview");
+  const image = preview?.querySelector("img");
+  const label = preview?.querySelector("span");
+  if (taskImagePreviewUrl) URL.revokeObjectURL(taskImagePreviewUrl);
+  taskImagePreviewUrl = "";
+  if (!file || !preview || !image) {
+    if (preview) preview.hidden = true;
+    return;
+  }
+  taskImagePreviewUrl = URL.createObjectURL(file);
+  image.src = taskImagePreviewUrl;
+  if (label) label.textContent = `${file.name} · ${(file.size / (1024 * 1024)).toFixed(1)} MB`;
+  preview.hidden = false;
+  if ($("taskExistingImageNote")) $("taskExistingImageNote").hidden = true;
+  if ($("taskImageUrl")) $("taskImageUrl").value = "";
+}
+
+function openTaskEditor(id = "") {
+  const activeRole = taskDashboardRole();
+  const task = id ? state.tasks.find((item) => item.id === id) : null;
+  if (id && !canManageTask(task)) return showToast("You can only edit tasks assigned to teams you manage or created in the Leaders account.", "error");
+  if (!canCreateTaskForRole(activeRole)) {
+    if (state.role === "leaders") showToast("An admin must assign your university or position team before you can assign tasks.", "error");
+    return;
+  }
+  if (!$("taskForm") || $("taskForm").dataset.saving === "true") return;
   $("taskForm").reset();
-  $("taskXp").value = "50";
-  $("taskTargetRole").value = "tech";
-  $("taskMode").value = "all";
-  $("taskModalTitle").textContent = "Assign a team task";
+  $("taskForm").dataset.taskId = task?.id || "";
+  if (taskImagePreviewUrl) {
+    URL.revokeObjectURL(taskImagePreviewUrl);
+    taskImagePreviewUrl = "";
+  }
+  if ($("taskImageUrl")) $("taskImageUrl").value = task?.imageUrl || "";
+  if ($("taskImageUploadProgress")) {
+    $("taskImageUploadProgress").hidden = true;
+    $("taskImageUploadProgress").value = 0;
+  }
+  if ($("taskImagePreview")) $("taskImagePreview").hidden = true;
+  if ($("taskExistingImageNote")) {
+    $("taskExistingImageNote").hidden = !task?.coverDriveFileId;
+    $("taskExistingImageNote").textContent = task?.coverDriveFileId
+      ? `Current Google Drive photo: ${task.coverDriveFileName || "uploaded image"}. It stays attached unless you choose a replacement.`
+      : "";
+  }
+  $("taskTitle").value = task?.title || "";
+  $("taskDescription").value = task?.description || "";
+  $("taskXp").value = String(task?.xp ?? 50);
+  if ($("taskDueAt")) {
+    const due = attendanceDate(task?.dueAt);
+    $("taskDueAt").value = due
+      ? new Date(due.getTime() - due.getTimezoneOffset() * 60000).toISOString().slice(0, 16)
+      : "";
+  }
+  const targetRole = $("taskTargetRole");
+   const allowedRoles = state.role === "admin" || hasDashboardAccess("tasksManage")
+     ? TASK_ROLE_ORDER
+     : state.role === "leaders"
+       ? ASSIGNABLE_DASHBOARD_ROLES
+       : currentTeamLeadRoles();
+  if (targetRole) {
+    const options = allowedRoles.filter((roleKey) => canCreateTaskForRole(roleKey))
+      .map((roleKey) => `<option value="${escapeAttr(roleKey)}">${escapeHtml(taskTargetRole({ targetRole: roleKey }))}</option>`).join("");
+    targetRole.innerHTML = `<optgroup label="Account roles">${options}</optgroup>${state.role === "admin" ? `<optgroup label="Leadership positions"><option value="${POSITION_LEADER_TASK_AUDIENCE}">Position leaders — all teams</option></optgroup>` : ""}`;
+    targetRole.value = task && canCreateTaskForRole(task.targetRole) ? task.targetRole
+      : allowedRoles.includes(activeRole) && canCreateTaskForRole(activeRole) ? activeRole
+        : (allowedRoles.find((roleKey) => canCreateTaskForRole(roleKey)) || "");
+    if (task) targetRole.value = task.targetRole;
+    targetRole.disabled = Boolean(task && (taskAssignmentLocked(task) || !hasDashboardAccess("tasksManage")));
+  }
+  const targetUniversity = $("taskTargetUniversity");
+  const memberScope = taskUniversityScopeForCurrentUser();
+  if (targetUniversity) {
+    if (state.role === "admin") {
+      targetUniversity.innerHTML = `<option value="">All universities</option>${UNIVERSITY_OPTIONS.map((university) => `<option value="${escapeAttr(university.tag)}">${escapeHtml(university.name)}</option>`).join("")}`;
+      targetUniversity.disabled = false;
+      targetUniversity.value = task?.targetUniversityTag || "";
+    } else if (state.role === "leaders") {
+      targetUniversity.innerHTML = memberScope
+        ? `<option value="${escapeAttr(memberScope)}">${escapeHtml(universityLabel(memberScope))}</option>`
+        : `<option value="">No university assigned</option>`;
+      targetUniversity.value = memberScope;
+      targetUniversity.disabled = true;
+    } else {
+      targetUniversity.innerHTML = `<option value="">All universities</option>`;
+      targetUniversity.value = task?.targetUniversityTag || "";
+      targetUniversity.disabled = true;
+    }
+    targetUniversity.disabled = Boolean(task && taskAssignmentLocked(task)) || targetUniversity.disabled;
+  }
+  if ($("taskMemberSearch")) $("taskMemberSearch").value = "";
+  refreshTaskMemberSelector(task?.assignedMemberUids || []);
+  const audienceLocked = Boolean(task && (taskAssignmentLocked(task) || !hasDashboardAccess("tasksManage")));
+  $("taskAssignedMembers")?.querySelectorAll("input").forEach((input) => { input.disabled = audienceLocked; });
+  if ($("taskMemberSearch")) $("taskMemberSearch").disabled = audienceLocked;
+  $("taskMode").value = task?.mode || "all";
+   $("taskMode").disabled = Boolean(task && (taskAssignmentLocked(task) || !hasDashboardAccess("tasksManage")));
+  $("taskModalTitle").textContent = task ? "Edit task" : "Assign a task";
+  const submitButton = $("taskForm").querySelector('button[type="submit"]');
+  if (submitButton) {
+    submitButton.textContent = task ? "Save changes" : "Assign task";
+    submitButton.disabled = false;
+  }
+  const intro = $("taskModal")?.querySelector(".modal-intro");
+  if (intro) intro.textContent = state.role === "admin"
+    ? "Choose a team, optional university, and specific people. Leave people unselected to assign the task to the whole matching team."
+    : state.role === "leaders" && universityByTag(memberScope)
+       ? `Tasks you create are limited to ${universityLabel(memberScope)}. Choose a team and optionally specific people from that university.`
+       : state.role === "leaders"
+         ? `Your task access is limited to the position teams an admin assigned to you: ${currentTeamLeadRoles().map((role) => ROLE_CONFIG[role]?.label || role).join(", ") || "none yet"}.`
+      : "Create tasks only for the team role you lead, and choose people from that team.";
+  if (intro && task) intro.textContent = `Update the task details. Its audience is locked after the first submission or when the task closes. Existing submissions and awarded XP are preserved.`;
   const assetRows = $("taskAssetsEditor")?.querySelector(".link-editor-rows");
-  if (assetRows) assetRows.innerHTML = "";
-  if ($("taskGameType")) $("taskGameType").value = "none";
+  if (assetRows) {
+    assetRows.innerHTML = "";
+    for (const asset of (task?.assets || []).slice(0, MAX_TASK_ASSETS)) {
+      assetRows.insertAdjacentHTML("beforeend", linkEditorRowMarkup());
+      const row = assetRows.lastElementChild;
+      row.querySelector("[data-link-label]").value = asset.label || "";
+      row.querySelector("[data-link-url]").value = asset.url || "";
+    }
+  }
+  if ($("taskGameType")) $("taskGameType").value = task?.gameType || "none";
+  if ($("taskGameUrl")) $("taskGameUrl").value = task?.gameUrl || "";
+  if ($("taskGameHtml")) $("taskGameHtml").value = task?.gameHtml || "";
   toggleTaskGameFields();
   updateTaskGameHtmlSize();
   openModal("taskModal");
@@ -1203,7 +2041,7 @@ async function submitTaskGameResult(gameResult) {
   }
   taskGameState.submitting = true;
   setTaskGameSubmitButton({ disabled: true, label: "جاري الإرسال…" });
-  setTaskGameStatus("Finished! Sending your result to the admins…");
+  setTaskGameStatus("Finished! Sending your result for review…");
   const summary = gameResult.summary ? ` — ${gameResult.summary}` : "";
   const text = (draft.text || `Completed the interactive task${summary}`).slice(0, 3000);
   const ok = await createTaskSubmission(taskGameState.taskId, { text, links: draft.links, gameResult });
@@ -1211,7 +2049,7 @@ async function submitTaskGameResult(gameResult) {
   if (ok) {
     taskGameState.finished = true;
     setTaskGameSubmitButton({ disabled: true, label: "✓ تم التسليم" });
-    setTaskGameStatus("Your result was sent for admin review. XP is added after approval. You can close this window.", "success");
+    setTaskGameStatus("Your result was sent for review. XP is added after approval. You can close this window.", "success");
   } else {
     setTaskGameSubmitButton({ disabled: false, label: "✓ تسليم التاسك" });
     setTaskGameStatus("Your result could not be sent. Please try the Submit button again.", "error");
@@ -1220,20 +2058,54 @@ async function submitTaskGameResult(gameResult) {
 
 async function saveTask(event) {
   event.preventDefault();
-  if (state.role !== "admin") return showToast("Only admins can assign tasks.", "error");
+  const form = $("taskForm");
+  const editId = form?.dataset.taskId || "";
+  const existingTask = editId ? state.tasks.find((item) => item.id === editId) : null;
+  if (form?.dataset.saving === "true") return;
+  if (editId && !canManageTask(existingTask)) return showToast("You can only edit tasks assigned to teams you manage or created in the Leaders account.", "error");
   const title = $("taskTitle")?.value.trim();
   const description = $("taskDescription")?.value.trim();
   const targetRole = $("taskTargetRole")?.value;
+  const targetUniversityTag = $("taskTargetUniversity")?.value || "";
+  const assignedMemberUids = [...new Set([...taskSelectedMemberUids].filter(Boolean))];
+  if (assignedMemberUids.length > 100) return showToast("Choose no more than 100 people for one task.", "error");
   const mode = $("taskMode")?.value;
   const xp = Number($("taskXp")?.value);
+  const dueValue = $("taskDueAt")?.value || "";
+  const dueAt = dueValue ? new Date(dueValue) : null;
+  if (dueAt && Number.isNaN(dueAt.getTime())) return showToast("Choose a valid deadline.", "error");
   if (!title || title.length < 3) return showToast("Give the task a clear title.", "error");
   if (!description || description.length < 8) return showToast("Add enough instructions for the team.", "error");
-  if (!TASK_ROLE_ORDER.includes(targetRole)) return showToast("Choose a valid team.", "error");
+  if (![...TASK_ROLE_ORDER, POSITION_LEADER_TASK_AUDIENCE].includes(targetRole)
+    || (editId
+      ? !existingTask || (!hasDashboardAccess("tasksManage") && targetRole !== existingTask.targetRole)
+      : !canCreateTaskForRole(targetRole))) return showToast("You can only assign tasks to an audience you are permitted to manage.", "error");
+  if (targetUniversityTag && !universityByTag(targetUniversityTag)) return showToast("Choose a valid university.", "error");
+  if (state.role === "leaders" && targetUniversityTag !== taskLeaderUniversityTag()) {
+    return showToast("You can only assign tasks to members of the university assigned to you.", "error");
+  }
+  const eligibleMembers = new Set(taskMemberChoices(targetRole, targetUniversityTag).map((member) => member.uid));
+  if (assignedMemberUids.some((uid) => !eligibleMembers.has(uid))) {
+    return showToast("Choose people who belong to the selected team and university.", "error");
+  }
   if (!Object.keys(TASK_MODE_LABELS).includes(mode)) return showToast("Choose a valid submission mode.", "error");
   if (!Number.isInteger(xp) || xp < 1 || xp > 100000) return showToast("XP must be a whole number from 1 to 100,000.", "error");
   const assetResult = collectLinkEntries($("taskAssetsEditor"));
   if (assetResult.error) return showToast(assetResult.error, "error");
   const assets = assetResult.links.slice(0, MAX_TASK_ASSETS);
+  const imageUrlInput = $("taskImageUrl")?.value.trim() || "";
+  const imageUrl = normalizePhotoUrl(imageUrlInput);
+  const coverFile = $("taskImageFile")?.files?.[0] || null;
+  if (imageUrlInput && !imageUrl) return showToast("Use a valid http:// or https:// image link.", "error");
+  if (coverFile && !isDriveStorageConfigured()) {
+    return showToast("Google Drive photo uploads are not connected yet. Finish the Drive setup before uploading a task photo.", "error");
+  }
+  if (coverFile && !["image/jpeg", "image/png", "image/webp"].includes(coverFile.type)) {
+    return showToast("Task photos must be JPG, PNG, or WebP images.", "error");
+  }
+  if (coverFile && coverFile.size > 10 * 1024 * 1024) {
+    return showToast("Task photos must be 10 MB or smaller.", "error");
+  }
   const gameType = $("taskGameType")?.value || "none";
   let gameUrl = "";
   let gameHtml = "";
@@ -1245,40 +2117,141 @@ async function saveTask(event) {
     if (gameHtml.length < 20) return showToast("Paste the HTML code or upload an .html file.", "error");
     if (gameHtml.length > MAX_TASK_GAME_HTML) return showToast("The HTML must be under 500 KB.", "error");
   }
+  const submitButton = form?.querySelector('button[type="submit"]');
+  if (form) form.dataset.saving = "true";
+  if (submitButton) {
+    submitButton.disabled = true;
+    submitButton.textContent = "Saving…";
+  }
+  let photoUploadError = null;
   try {
-    const taskRef = await addDoc(collection(db, "tasks"), {
-      title, description, targetRole, mode, xp, status: "open",
-      submissionCount: 0, claimedByUid: "", createdBy: state.user.uid,
-      assets, gameType: gameType === "none" ? "" : gameType, gameUrl, gameHtml,
-      createdAt: serverTimestamp(), updatedAt: serverTimestamp()
-    });
-    const recipients = state.teamMembers.filter((member) => member.active === true
-      && (member.role === targetRole
-        || (member.role === "admin" && (targetRole === "admin" || adminTeamAssignment(member)?.role === targetRole))));
+    const keepExistingDriveCover = Boolean(existingTask?.coverDriveFileId && !imageUrl);
+    const keepExistingImageDuringUpload = Boolean(coverFile && existingTask?.imageUrl);
+    const editable = {
+      title, description, targetRole, targetUniversityTag, assignedMemberUids,
+      audienceMode: assignedMemberUids.length ? "selected" : "all",
+      mode, xp, assets, dueAt,
+      imageUrl: coverFile ? (keepExistingImageDuringUpload ? existingTask.imageUrl : "") : imageUrl,
+      coverDriveFileId: keepExistingDriveCover ? existingTask.coverDriveFileId : "",
+      coverDriveFileName: keepExistingDriveCover ? existingTask.coverDriveFileName : "",
+      coverDriveMimeType: keepExistingDriveCover ? existingTask.coverDriveMimeType : "",
+      coverDriveSizeBytes: keepExistingDriveCover ? Number(existingTask.coverDriveSizeBytes) || 0 : 0,
+      coverDriveUploadedByUid: keepExistingDriveCover ? existingTask.coverDriveUploadedByUid : "",
+      coverDriveUploadedAt: keepExistingDriveCover ? existingTask.coverDriveUploadedAt : "",
+      gameType: gameType === "none" ? "" : gameType, gameUrl, gameHtml,
+      updatedAt: serverTimestamp()
+    };
+    let taskRef;
+    if (editId) {
+      taskRef = doc(db, "tasks", editId);
+      await runTransaction(db, async (transaction) => {
+        const snapshot = await transaction.get(taskRef);
+        if (!snapshot.exists()) throw new Error("This task was deleted. Close the editor and refresh the task list.");
+        const current = snapshot.data();
+        if (taskAssignmentLocked(current) && (current.targetRole !== targetRole || current.mode !== mode)) {
+          throw new Error("This task now has submissions or is closed. Reopen the editor; its audience and submission mode cannot be changed.");
+        }
+        transaction.update(taskRef, editable);
+      });
+    } else {
+      taskRef = await addDoc(collection(db, "tasks"), {
+        ...editable, status: "open", submissionCount: 0, claimedByUid: "",
+        createdBy: state.user.uid,
+        createdByName: memberDisplayName(state.member, state.user),
+        createdByPhotoURL: profilePhotoDisplayUrl(state.member),
+        createdAt: serverTimestamp()
+      });
+    }
+    if (coverFile) {
+      try {
+        const progress = $("taskImageUploadProgress");
+        if (progress) { progress.hidden = false; progress.value = 0; }
+        const uploaded = await uploadDriveFile(auth, coverFile, {
+          category: "taskCover",
+          sourceId: taskRef.id,
+          targetRole,
+          sizeBytes: coverFile.size
+        }, {
+          onProgress: (percent) => { if (progress) progress.value = percent; }
+        });
+        await updateDoc(taskRef, {
+          imageUrl: "",
+          coverDriveFileId: uploaded.id,
+          coverDriveFileName: uploaded.fileName || coverFile.name,
+          coverDriveMimeType: uploaded.mimeType || coverFile.type,
+          coverDriveSizeBytes: Number(uploaded.sizeBytes) || coverFile.size,
+          coverDriveUploadedByUid: state.user.uid,
+          coverDriveUploadedAt: uploaded.uploadedAt || new Date().toISOString(),
+          updatedAt: serverTimestamp()
+        });
+      } catch (error) { photoUploadError = error; }
+    }
+    let assignmentError = null;
+    try {
+      await syncTaskRecipientAssignments(taskRef.id, existingTask?.assignedMemberUids || [], assignedMemberUids);
+    } catch (error) { assignmentError = error; }
     let notificationError = null;
     try {
+      const recipientSnapshot = await getDocs(query(collection(db, "teamMembers"), where("active", "==", true)));
+      const recipients = recipientSnapshot.docs.map((item) => ({ uid: item.id, ...item.data() })).filter((member) =>
+        taskMatchesAudience({ targetRole, targetUniversityTag, assignedMemberUids }, member, member.uid));
       await notifyInboxMembers(
         recipients,
         "task_available",
-        `New task for ${taskTargetRole({ targetRole })}: ${title}`,
-        `A new task is ready for your team. Reward: up to ${xp} XP.`,
-        { taskId: taskRef.id }
+        `${editId ? "Task updated" : "New task"} for ${taskTargetRole({ targetRole })}: ${title}`,
+        `${editId ? "A task manager updated this task. Open it to review the latest details." : "A new task is ready for your team."} Reward: up to ${xp} XP.`,
+        { taskId: taskRef.id, taskRole: targetRole }
       );
     } catch (error) { notificationError = error; }
     closeModal("taskModal");
-    showToast(notificationError
-      ? `Task assigned, but inbox notices could not be sent: ${firebaseError(notificationError)}`
-      : `Task assigned to the ${taskTargetRole({ targetRole })} team and they were notified.`,
-      notificationError ? "error" : "ok");
+    if (editId) refs.taskSubmissionsViewer?.classList.add("hidden");
+    showToast(assignmentError
+      ? `Task saved, but individual assignments could not be updated: ${firebaseError(assignmentError)}`
+      : notificationError
+        ? `Task ${editId ? "saved" : "assigned"}, but inbox notices could not be sent: ${firebaseError(notificationError)}`
+        : photoUploadError
+          ? `Task saved, but its photo could not be uploaded: ${firebaseError(photoUploadError)}. You can edit the task and try again.`
+          : editId ? "Task updated. Existing submissions and awarded XP were preserved."
+            : `Task assigned to ${taskTargetLabel({ targetRole })} and they were notified.`,
+      assignmentError || notificationError || photoUploadError ? "error" : "ok");
     await loadTasks();
   } catch (error) {
     showToast(firebaseError(error), "error");
+  } finally {
+    if (form) form.dataset.saving = "false";
+    if (submitButton) {
+      submitButton.disabled = false;
+      submitButton.textContent = editId ? "Save changes" : "Assign task";
+    }
+  }
+}
+
+async function syncTaskRecipientAssignments(taskId, previousUids, nextUids) {
+  const previous = new Set(Array.isArray(previousUids) ? previousUids : []);
+  const next = new Set(Array.isArray(nextUids) ? nextUids : []);
+  if ([...previous].every((uid) => next.has(uid)) && [...next].every((uid) => previous.has(uid))) return;
+  const operations = [];
+  for (const uid of previous) {
+    if (!next.has(uid)) operations.push((batch) => batch.delete(doc(db, "teamMembers", uid, "taskAssignments", taskId)));
+  }
+  for (const uid of next) {
+    if (!previous.has(uid)) {
+      operations.push((batch) => batch.set(doc(db, "teamMembers", uid, "taskAssignments", taskId), {
+        taskId, createdAt: serverTimestamp()
+      }));
+    }
+  }
+  for (let offset = 0; offset < operations.length; offset += 10) {
+    const batch = writeBatch(db);
+    operations.slice(offset, offset + 10).forEach((apply) => apply(batch));
+    await batch.commit();
   }
 }
 
 function readTaskSubmissionDraft(id) {
   const text = $(`task-text-${id}`)?.value.trim() || "";
-  const linkResult = collectLinkEntries(findLinkEditor(refs.tasksList, id));
+  const editor = findLinkEditor($("taskDetailsContent"), id) || findLinkEditor(refs.tasksList, id);
+  const linkResult = collectLinkEntries(editor);
   return { text, links: linkResult.links, error: linkResult.error };
 }
 
@@ -1294,7 +2267,7 @@ async function submitTask(id) {
     return createTaskSubmission(id, { text, links: draft.links });
   }
   if (draft.text.length < 3) return showToast("Write a short description of what you completed.", "error");
-  await createTaskSubmission(id, { text: draft.text, links: draft.links });
+  return createTaskSubmission(id, { text: draft.text, links: draft.links });
 }
 
 async function createTaskSubmission(id, { text, links = [], gameResult = null }) {
@@ -1331,18 +2304,22 @@ async function createTaskSubmission(id, { text, links = [], gameResult = null })
     });
     let notificationError = null;
     try {
-      const reviewers = await getDocs(query(collection(db, "teamMembers"),
-        where("active", "==", true), where("role", "==", "admin")));
-      const task = state.tasks.find((item) => item.id === id);
-      await notifyInboxMembers(reviewers.docs.map((item) => ({ ...item.data(), uid: item.id })),
+    const task = state.tasks.find((item) => item.id === id);
+    const reviewers = await getDocs(query(collection(db, "teamMembers"), where("active", "==", true)));
+    const reviewerMembers = reviewers.docs.map((item) => ({ uid: item.id, ...item.data() }))
+      .filter((member) => member.role === "admin"
+        || (member.role === "leaders" && task?.createdBy === member.uid)
+        || (task?.targetRole !== POSITION_LEADER_TASK_AUDIENCE
+          && Array.isArray(member.teamLeadRoles) && member.teamLeadRoles.includes(task?.targetRole)));
+      await notifyInboxMembers(reviewerMembers,
         "task_submitted", "A task is ready for review",
         `${currentName} submitted ${task?.title || "a task"} for review.`,
-        { taskId: id }, 3, `task-submitted_${id}_${state.user.uid}`);
+        { taskId: id, taskRole: task?.targetRole || "" }, 3, `task-submitted_${id}_${state.user.uid}`);
     } catch (error) { notificationError = error; }
     updateProfileSummary();
     showToast(notificationError
-      ? "Task submitted successfully, but the admin inbox notice could not be sent. Do not submit again."
-      : "Task submitted for admin review. XP will be added after approval.",
+      ? "Task submitted successfully, but the reviewer inbox notice could not be sent. Do not submit again."
+      : "Task submitted for review. XP will be added after approval.",
       notificationError ? "error" : "ok");
     await loadTasks();
     return true;
@@ -1353,9 +2330,8 @@ async function createTaskSubmission(id, { text, links = [], gameResult = null })
 }
 
 async function viewTaskSubmissions(id) {
-  if (state.role !== "admin" || !refs.taskSubmissionsViewer) return;
   const task = state.tasks.find((item) => item.id === id);
-  if (!task) return;
+  if (!task || !canManageTask(task) || !refs.taskSubmissionsViewer) return;
   refs.taskSubmissionsViewer.classList.remove("hidden");
   refs.taskSubmissionsViewer.innerHTML = `<div class="empty-state">Loading submissions…</div>`;
   try {
@@ -1371,6 +2347,7 @@ async function viewTaskSubmissions(id) {
       const reviewed = reviewStatus !== "pending";
       return `<article class="task-submission ${reviewStatus === "approved" ? "is-approved" : reviewStatus === "rejected" ? "is-rejected" : "is-pending"}"><div class="task-submission-top"><strong>${escapeHtml(submission.submitterName || "Team member")}</strong><span>${escapeHtml(formatDate(submission.submittedAt))} · ${reviewStatus === "pending" ? "Awaiting review" : `${reviewStatus === "approved" ? "+" : ""}${Number(submission.xpAwarded) || 0} XP · ${escapeHtml(reviewStatus)}`}</span></div><p>${escapeHtml(submission.text)}</p>${taskGameResultMarkup(submission)}${taskSubmissionLinksMarkup(submission)}${reviewed ? `<div class="review-result">${reviewStatus === "approved" ? "Approved and rewarded." : "Rejected — no XP awarded."}</div>` : `<form class="submission-review-form" data-review-submission="${escapeAttr(submission.id)}"><label>XP to award<input type="number" name="xp" min="0" max="100000" step="1" value="${Number(task.xp) || 0}" required></label><button class="btn btn-primary btn-compact" type="submit" data-review-decision="approved">Approve & award XP</button><button class="btn btn-outline btn-compact" type="submit" data-review-decision="rejected">Reject</button></form>`}</article>`;
     }).join("")}</div>` : `<div class="empty-state">No submissions yet.</div>`}`;
+    if (!canManageTask(task)) refs.taskSubmissionsViewer.querySelectorAll(".submission-review-form").forEach((form) => form.remove());
     $("closeTaskSubmissionsBtn")?.addEventListener("click", () => refs.taskSubmissionsViewer.classList.add("hidden"));
     refs.taskSubmissionsViewer.querySelectorAll("[data-review-submission]").forEach((form) => form.addEventListener("submit", (event) => {
       event.preventDefault();
@@ -1383,7 +2360,9 @@ async function viewTaskSubmissions(id) {
 }
 
 async function reviewTaskSubmission(taskId, submissionUid, decision, rawXp) {
-  if (state.role !== "admin") return showToast("Only admins can review submissions.", "error");
+  if (state.role !== "admin" && submissionUid === state.user?.uid) return showToast("Ask another task manager to review your own submission.", "error");
+  const task = state.tasks.find((item) => item.id === taskId);
+  if (!task || !canManageTask(task)) return showToast("You can only review submissions for teams you manage or tasks you created.", "error");
   const xp = decision === "approved" ? Number(rawXp) : 0;
   if (decision === "approved" && (!Number.isInteger(xp) || xp < 0 || xp > 100000)) return showToast("XP must be a whole number from 0 to 100,000.", "error");
   const taskRef = doc(db, "tasks", taskId);
@@ -1397,6 +2376,7 @@ async function reviewTaskSubmission(taskId, submissionUid, decision, rawXp) {
       ]);
       if (!taskSnapshot.exists() || !submissionSnapshot.exists()) throw new Error("This submission no longer exists.");
       const taskData = taskSnapshot.data();
+      if (!canManageTask(taskData)) throw new Error("You can only review submissions for teams you manage or tasks you created.");
       const submissionData = submissionSnapshot.data();
       const currentStatus = submissionData.status || (Number(submissionData.xpAwarded) > 0 ? "approved" : "pending");
       if (currentStatus !== "pending") throw new Error("This submission has already been reviewed.");
@@ -1416,7 +2396,7 @@ async function reviewTaskSubmission(taskId, submissionUid, decision, rawXp) {
         decision === "approved"
           ? `Your submission for “${taskData.title}” was approved. ${xp} XP was added.`
           : `Your submission for “${taskData.title}” was reviewed and needs changes. No XP was added.`,
-        { taskId, reviewStatus: decision }
+         { taskId, taskRole: taskData.targetRole, reviewStatus: decision }
       ));
       if (decision === "approved") {
         transaction.update(memberRef, {
@@ -1438,9 +2418,9 @@ async function reviewTaskSubmission(taskId, submissionUid, decision, rawXp) {
 }
 
 async function closeTask(id) {
-  if (state.role !== "admin") return;
   const task = state.tasks.find((item) => item.id === id);
-  if (!task || task.status !== "open" || !confirm(`Close “${task.title}”? Team members will no longer be able to submit it.`)) return;
+  if (!task || !canManageTask(task)) return showToast("You can only manage tasks for teams you lead or tasks you created.", "error");
+  if (task.status !== "open" || !confirm(`Close “${task.title}”? Team members will no longer be able to submit it.`)) return;
   try {
     await updateDoc(doc(db, "tasks", id), { status: "closed", updatedAt: serverTimestamp() });
     showToast("Task closed.");
@@ -1451,10 +2431,11 @@ async function closeTask(id) {
 }
 
 async function deleteTask(id) {
-  if (state.role !== "admin") return;
   const task = state.tasks.find((item) => item.id === id);
-  if (!task || !confirm(`Delete “${task.title}”? Its submission records will remain unless removed separately.`)) return;
+  if (!task || !canManageTask(task)) return showToast("You can only manage tasks for teams you lead or tasks you created.", "error");
+  if (!confirm(`Delete “${task.title}”? Its submission records will remain unless removed separately.`)) return;
   try {
+    await syncTaskRecipientAssignments(id, task.assignedMemberUids || [], []);
     await deleteDoc(doc(db, "tasks", id));
     showToast("Task deleted.");
     if (refs.taskSubmissionsViewer) refs.taskSubmissionsViewer.classList.add("hidden");
@@ -1487,7 +2468,7 @@ async function loadTeamQuestions() {
   try {
     let snapshot;
     const base = collection(db, "questions");
-    const inboxRole = state.role === "admin" && state.activeDashboardRole !== "admin"
+    const inboxRole = hasDashboardAccess("questionsRead") ? "admin" : state.role === "admin" && state.activeDashboardRole !== "admin"
       ? state.activeDashboardRole
       : state.role;
     try {
@@ -1518,6 +2499,23 @@ function renderTeamQuestions(items) {
       <button type="button" class="btn btn-primary btn-compact" data-answer-question="${escapeAttr(item.id)}">Publish answer</button>
     </article>`).join("") : `<div class="empty-state">No unanswered questions for this dashboard.</div>`;
   refs.teamQuestionsList.querySelectorAll("[data-answer-question]").forEach((button) => button.addEventListener("click", () => answerQuestion(button.dataset.answerQuestion)));
+  refs.teamQuestionsList.querySelectorAll("[data-answer-question]").forEach((button) => {
+    const question = items.find((item) => item.id === button.dataset.answerQuestion);
+    if (hasDashboardAccess("questionsManage")) {
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "btn btn-danger btn-compact";
+      remove.textContent = "Delete question";
+      remove.addEventListener("click", async () => {
+        if (!confirm("Delete this question permanently?")) return;
+        try { await deleteDoc(doc(db, "questions", question.id)); await loadTeamQuestions(); }
+        catch (error) { showToast(firebaseError(error), "error"); }
+      });
+      button.closest("article").appendChild(remove);
+    } else if (question?.targetRole !== state.role) {
+      button.closest("article").querySelectorAll(".answer-field,.link-editor,[data-answer-question]").forEach((element) => element.remove());
+    }
+  });
   bindLinkEditors(refs.teamQuestionsList);
 }
 
@@ -1531,7 +2529,8 @@ async function answerQuestion(id) {
   const links = linkResult.links;
   const question = state.questions.find((item) => item.id === id);
   if (!question) return;
-  const answeredByRole = state.role === "admin" ? (question.targetRole || "admin") : state.role;
+  if (question.targetRole !== state.role && !hasDashboardAccess("questionsManage")) return showToast("Question management access is required.", "error");
+  const answeredByRole = question.targetRole || state.role;
   const memberRef = doc(db, "teamMembers", state.user.uid);
   const questionRef = doc(db, "questions", id);
   const askerInboxRef = question.ownerUid ? doc(collection(db, "teamMembers", question.ownerUid, "notifications")) : null;
@@ -1609,6 +2608,10 @@ function normalizePhotoUrl(value) {
   } catch (_) {
     return "";
   }
+}
+
+function profilePhotoDisplayUrl(profile) {
+  return driveProfilePhotoUrl(profile?.photoDriveFileId) || normalizePhotoUrl(profile?.photoURL || "");
 }
 
 function normalizeHttpUrl(value) {
@@ -1702,11 +2705,20 @@ function taskSubmissionLinksMarkup(submission) {
 
 function profileAvatarMarkup(profile, size = "small") {
   const name = memberDisplayName(profile);
-  const photo = normalizePhotoUrl(profile?.photoURL || "");
+  const photo = profilePhotoDisplayUrl(profile);
+  const fallback = normalizePhotoUrl(profile?.photoURL || "");
   return photo
-    ? `<img class="profile-avatar profile-avatar-${size}" src="${escapeAttr(photo)}" alt="${escapeAttr(name)}" loading="lazy" referrerpolicy="no-referrer">`
+    ? `<img class="profile-avatar profile-avatar-${size}" src="${escapeAttr(photo)}"${fallback && fallback !== photo ? ` data-fallback-src="${escapeAttr(fallback)}"` : ""} alt="${escapeAttr(name)}" loading="${size === "hero" ? "eager" : "lazy"}" decoding="async"${size === "hero" ? ' fetchpriority="high"' : ""} referrerpolicy="no-referrer">`
     : `<span class="profile-avatar profile-avatar-${size} profile-avatar-fallback" aria-hidden="true">${escapeHtml(name.slice(0, 1).toUpperCase())}</span>`;
 }
+
+document.addEventListener("error", (event) => {
+  const image = event.target;
+  if (!(image instanceof HTMLImageElement) || !image.matches("img.profile-avatar[data-fallback-src]")) return;
+  const fallback = image.dataset.fallbackSrc;
+  image.removeAttribute("data-fallback-src");
+  if (fallback) image.src = fallback;
+}, true);
 
 function profileIdentityMarkup(profile) {
   const name = memberDisplayName(profile);
@@ -1725,75 +2737,24 @@ function addProfilePhotoControls() {
     <div class="profile-photo-tools">
       <label>Upload a profile photo
         <input id="profilePhotoFile" type="file" accept="image/jpeg,image/png,image/webp">
-        <small>Choose a JPEG, PNG, or WebP image up to 10 MB. It is resized in your browser before it is sent to ImgBB, so nothing is stored on InfinityFree.</small>
+        <small>Choose a JPEG, PNG, or WebP image up to 10 MB. It is resized first, then uploaded privately through the secured Drive service. Profile photos are made individually viewable so they can appear across the website.</small>
       </label>
       <div class="profile-photo-preview-row">
         <img id="profilePhotoPreviewImage" class="profile-photo-preview-image" alt="Profile photo preview" hidden>
         <span id="profilePhotoPreviewFallback" class="profile-photo-preview-fallback">No photo selected</span>
         <span class="profile-photo-preview-label">Preview</span>
       </div>
-      <div class="profile-imgbb-settings">
-        <strong>One-time ImgBB setup on this browser</strong>
-        <p>Get an API key from <a href="https://api.imgbb.com/" target="_blank" rel="noopener noreferrer">ImgBB</a>, enter it below, then choose “Save key”. The key stays in this browser’s local storage and is sent directly to ImgBB. Do this only on a device you trust; someone using this signed-in browser can inspect it.</p>
-        <div class="profile-imgbb-key-row">
-          <label for="profileImgBbKey">ImgBB API key
-            <input id="profileImgBbKey" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your ImgBB API key">
-          </label>
-          <button id="saveImgBbKeyBtn" class="btn btn-outline btn-compact" type="button">Save key</button>
-          <button id="clearImgBbKeyBtn" class="btn btn-outline btn-compact" type="button">Forget key</button>
-        </div>
-        <small id="profileImgBbKeyStatus" class="profile-photo-status" aria-live="polite"></small>
-      </div>
+      <progress id="profilePhotoProgress" class="drive-upload-progress" max="100" value="0" hidden></progress>
       <small id="profilePhotoStatus" class="profile-photo-status" aria-live="polite"></small>
     </div>
   `);
 
-  const keyStatus = $("profileImgBbKeyStatus");
-  if (keyStatus && getStoredImgBbKey()) keyStatus.textContent = "An ImgBB key is saved in this browser.";
   $("profilePhotoFile")?.addEventListener("change", handleProfilePhotoSelection);
   $("profilePhotoUrl")?.addEventListener("input", () => {
     state.profilePhotoFile = null;
     if ($("profilePhotoFile")) $("profilePhotoFile").value = "";
     renderProfilePhotoPreview($("profilePhotoUrl")?.value.trim() || "");
   });
-  $("saveImgBbKeyBtn")?.addEventListener("click", saveImgBbKey);
-  $("clearImgBbKeyBtn")?.addEventListener("click", clearImgBbKey);
-}
-
-function getStoredImgBbKey() {
-  try {
-    return localStorage.getItem(IMGBB_KEY_STORAGE_KEY) || "";
-  } catch (_) {
-    return "";
-  }
-}
-
-function saveImgBbKey() {
-  const input = $("profileImgBbKey");
-  const key = input?.value.trim() || "";
-  if (key.length < 10) {
-    showToast("Enter a valid ImgBB API key first.", "error");
-    return;
-  }
-  try {
-    localStorage.setItem(IMGBB_KEY_STORAGE_KEY, key);
-    if (input) input.value = "";
-    if ($("profileImgBbKeyStatus")) $("profileImgBbKeyStatus").textContent = "ImgBB key saved in this browser only.";
-    showToast("ImgBB uploads are ready on this browser.");
-  } catch (_) {
-    if ($("profileImgBbKeyStatus")) $("profileImgBbKeyStatus").textContent = "This browser blocked local storage; allow it or use a different browser.";
-    showToast("Could not save the ImgBB key in this browser.", "error");
-  }
-}
-
-function clearImgBbKey() {
-  try {
-    localStorage.removeItem(IMGBB_KEY_STORAGE_KEY);
-    if ($("profileImgBbKeyStatus")) $("profileImgBbKeyStatus").textContent = "Saved ImgBB key removed from this browser.";
-    showToast("Saved ImgBB key removed.");
-  } catch (_) {
-    showToast("Could not remove the saved key from this browser.", "error");
-  }
 }
 
 function renderProfilePhotoPreview(value, ownedObjectUrl = "") {
@@ -1855,7 +2816,9 @@ async function handleProfilePhotoSelection(event) {
   const file = event.target.files?.[0];
   if (!file) return;
   try {
+    if (!isDriveStorageConfigured()) throw new Error("Google Drive upload setup is not finished yet. The selected photo was not uploaded.");
     setProfilePhotoStatus("Resizing photo in your browser…");
+    if ($("profilePhotoProgress")) { $("profilePhotoProgress").hidden = true; $("profilePhotoProgress").value = 0; }
     const resized = await resizeProfilePhoto(file);
     state.profilePhotoFile = resized;
     $("profilePhotoUrl").value = "";
@@ -1866,23 +2829,6 @@ async function handleProfilePhotoSelection(event) {
     event.target.value = "";
     setProfilePhotoStatus(error.message || "Could not prepare this photo.", true);
   }
-}
-
-async function uploadProfilePhotoToImgBb(file) {
-  const apiKey = getStoredImgBbKey();
-  if (!apiKey) throw new Error("Save an ImgBB API key in the profile photo settings before uploading.");
-
-  const formData = new FormData();
-  formData.append("image", file, "profile-photo.jpg");
-  const response = await fetch(`https://api.imgbb.com/1/upload?key=${encodeURIComponent(apiKey)}`, {
-    method: "POST",
-    body: formData
-  });
-  const result = await response.json().catch(() => null);
-  if (!response.ok || !result?.success || !result?.data?.url) {
-    throw new Error(result?.error?.message || `ImgBB upload failed (HTTP ${response.status}). Check the API key and try again.`);
-  }
-  return result.data.url;
 }
 
 // Presentation only: roles still come from the existing Firebase member record.
@@ -1943,6 +2889,9 @@ function updateProfileSummary() {
   decorateRoleSurface($("profilePanel"), state.role);
   const name = memberDisplayName(state.member, state.user);
   const level = levelForXp(state.member.xp);
+  const publicProfileHref = `profile.html?uid=${encodeURIComponent(state.user.uid)}`;
+  if ($("editPublicProfileButton")) $("editPublicProfileButton").href = publicProfileHref;
+  if ($("profilePageLink")) $("profilePageLink").href = publicProfileHref;
   const avatar = $("teamAvatar");
   if (avatar) avatar.innerHTML = profileAvatarMarkup({ ...state.member, displayName: name }, "large");
   if ($("teamWelcome")) $("teamWelcome").textContent = `${name} · ${ROLE_CONFIG[state.role]?.label || state.role} · ${universityLabel(state.member.universityTag)}`;
@@ -1960,7 +2909,7 @@ function updateProfileSummary() {
     if (input) input.value = state.member.socialLinks?.[key] || "";
   }
   if ($("profileSocialPreview")) $("profileSocialPreview").innerHTML = socialLinksMarkup(state.member.socialLinks);
-  renderProfilePhotoPreview(state.member.photoURL || "");
+  renderProfilePhotoPreview(profilePhotoDisplayUrl(state.member));
 }
 
 async function saveProfile(event) {
@@ -1977,26 +2926,88 @@ async function saveProfile(event) {
     socialLinks = validateSocialLinks(Object.fromEntries(Object.keys(SOCIAL_PLATFORMS).map(key => [key, $("social-"+key)?.value || ""])));
   } catch (error) { return showToast(error.message, "error"); }
   const saveButton = $("saveProfileBtn");
+  const oldPhotoDriveFileId = state.member.photoDriveFileId || "";
+  let pendingPhotoDriveFileId = "";
   try {
     if (saveButton) {
       saveButton.disabled = true;
       saveButton.textContent = state.profilePhotoFile ? "Uploading photo…" : "Saving…";
     }
     if (state.profilePhotoFile) {
-      setProfilePhotoStatus("Uploading your resized photo to ImgBB…");
-      photoURL = await uploadProfilePhotoToImgBb(state.profilePhotoFile);
+      if (!isDriveStorageConfigured()) throw new Error("Google Drive upload setup is not finished yet.");
+      const progress = $("profilePhotoProgress");
+      if (progress) { progress.hidden = false; progress.value = 0; }
+      setProfilePhotoStatus("Uploading your resized photo to Google Drive…");
+      const uploaded = await uploadDriveFile(auth, state.profilePhotoFile, {
+        category: "profile",
+        sizeBytes: state.profilePhotoFile.size
+      }, {
+        onProgress: (percent) => {
+          if (progress) progress.value = percent;
+          setProfilePhotoStatus(`Uploading profile photo… ${percent}%`);
+        }
+      });
+      if (!uploaded.id) throw new Error("The image uploaded, but Google Drive did not return its file ID.");
+      pendingPhotoDriveFileId = uploaded.id;
+      photoURL = driveProfilePhotoUrl(uploaded.id);
+      if (!photoURL) throw new Error("Google Drive returned an invalid profile photo ID.");
+      await updateDoc(doc(db, "teamMembers", state.user.uid), {
+        displayName, photoURL, photoDriveFileId: uploaded.id,
+        photoFileName: uploaded.fileName, photoMimeType: uploaded.mimeType,
+        photoSizeBytes: uploaded.sizeBytes, photoUploadedByUid: state.user.uid,
+        photoUploadedAt: serverTimestamp(), bio, socialLinks, updatedAt: serverTimestamp()
+      });
+      pendingPhotoDriveFileId = "";
+      state.member = {
+        ...state.member, displayName, photoURL, photoDriveFileId: uploaded.id,
+        photoFileName: uploaded.fileName, photoMimeType: uploaded.mimeType,
+        photoSizeBytes: uploaded.sizeBytes, photoUploadedByUid: state.user.uid,
+        photoUploadedAt: new Date(), bio, socialLinks
+      };
+      state.profilePhotoFile = null;
+      if ($("profilePhotoFile")) $("profilePhotoFile").value = "";
+      updateProfileSummary();
+      if (oldPhotoDriveFileId && oldPhotoDriveFileId !== uploaded.id) {
+        try { await retireDriveProfilePhoto(auth, oldPhotoDriveFileId); }
+        catch (_) { setProfilePhotoStatus("Photo updated. The previous Drive copy could not be removed automatically."); }
+      }
+      if ($("profilePhotoProgress")) $("profilePhotoProgress").hidden = true;
+      setProfilePhotoStatus("Profile photo saved to Google Drive.");
+      showToast("Your profile and photo were updated.");
+      return;
     }
-    await updateDoc(doc(db, "teamMembers", state.user.uid), { displayName, photoURL, bio, socialLinks, updatedAt: serverTimestamp() });
-    state.member = { ...state.member, displayName, photoURL, bio, socialLinks };
+    const keepDrivePhoto = photoURL && photoURL === state.member.photoURL;
+    const update = {
+      displayName, photoURL, bio, socialLinks, updatedAt: serverTimestamp(),
+      photoDriveFileId: keepDrivePhoto ? state.member.photoDriveFileId || "" : "",
+      photoFileName: keepDrivePhoto ? state.member.photoFileName || "" : "",
+      photoMimeType: keepDrivePhoto ? state.member.photoMimeType || "" : "",
+      photoSizeBytes: keepDrivePhoto ? Number(state.member.photoSizeBytes) || 0 : 0,
+      photoUploadedByUid: keepDrivePhoto ? state.member.photoUploadedByUid || "" : "",
+      photoUploadedAt: keepDrivePhoto ? state.member.photoUploadedAt || "" : ""
+    };
+    await updateDoc(doc(db, "teamMembers", state.user.uid), update);
+    state.member = { ...state.member, ...update, photoURL };
+    if (!keepDrivePhoto && oldPhotoDriveFileId) {
+      try { await retireDriveProfilePhoto(auth, oldPhotoDriveFileId); } catch (_) { /* A replaced image can be cleaned up later. */ }
+    }
     state.profilePhotoFile = null;
     if ($("profilePhotoFile")) $("profilePhotoFile").value = "";
     updateProfileSummary();
+    if ($("profilePhotoProgress")) $("profilePhotoProgress").hidden = true;
     setProfilePhotoStatus(photoURL ? "Profile photo saved." : "");
     showToast("Your profile was updated.");
   } catch (error) {
-    setProfilePhotoStatus(error.message || "Your profile could not be saved.", true);
-    showToast(firebaseError(error), "error");
+    if (pendingPhotoDriveFileId) {
+      try { await retireDriveProfilePhoto(auth, pendingPhotoDriveFileId); } catch (_) { /* Keep the profile-save error visible. */ }
+    }
+    const message = pendingPhotoDriveFileId && isProfilePermissionDenied(error)
+      ? "The photo reached Google Drive, but Firestore denied saving it to your profile. Publish the updated firestore.rules to the Firebase project used by this site, then try again."
+      : profileWriteError(error, "your profile");
+    setProfilePhotoStatus(message, true);
+    showToast(message, "error");
   } finally {
+    if ($("profilePhotoProgress")) $("profilePhotoProgress").hidden = true;
     if (saveButton) {
       saveButton.disabled = false;
       saveButton.textContent = "Save profile";
@@ -2289,13 +3300,17 @@ async function sendChatMessage(event) {
 }
 
 async function loadTeamMembers() {
-  if (!state.isTeam || !(["admin", "leaders"].includes(state.role) || currentTeamLeadRoles().length)) return;
+  if (!state.isTeam || !(canReadAllTeam() || ["admin", "leaders"].includes(state.role) || currentTeamLeadRoles().length)) return;
   try {
     let memberDocuments;
-    if (state.role === "admin") {
-      memberDocuments = (await getDocs(collection(db, "teamMembers"))).docs;
+    if (canReadAllTeam()) {
+      const activeDocuments = (await getDocs(query(collection(db, "teamMembers"), where("active", "==", true)))).docs;
+      const inactiveDocuments = state.role === "admin"
+        ? (await getDocs(query(collection(db, "teamMembers"), where("active", "==", false)))).docs
+        : [];
+      memberDocuments = [...new Map([...activeDocuments, ...inactiveDocuments].map((item) => [item.id, item])).values()];
     } else {
-      const universityTag = String(state.member?.leadingUniversityTag || "").trim();
+      const universityTag = taskLeaderUniversityTag();
       const hasUniversityScope = state.role === "leaders" && Boolean(universityByTag(universityTag));
       const teamLeadRoles = currentTeamLeadRoles();
       if (!hasUniversityScope && !teamLeadRoles.length) {
@@ -2310,17 +3325,18 @@ async function loadTeamMembers() {
           && (teamLeadRoles.includes(data.role) || (hasUniversityScope && data.universityTag === universityTag));
       });
     }
-    const ratingDocuments = state.role === "admin"
+    const ratingDocuments = canReadAllRatings()
       ? (await getDocs(collection(db, "memberRatings"))).docs
       : await Promise.all(memberDocuments
-        .filter((item) => item.id !== state.user?.uid && item.data().role !== "admin")
+        .filter((item) => canManageMember({ uid: item.id, ...item.data() }))
         .map((item) => getDoc(doc(db, "memberRatings", item.id))));
     const ratingByUid = new Map(ratingDocuments
       .filter((item) => item.exists())
       .map((item) => [item.id, item.data()]));
     state.teamMembers = memberDocuments
       .map((item) => ({ uid: item.id, ...item.data() }))
-      .filter((member) => member.active !== false && (state.role === "admin" || member.uid !== state.user?.uid))
+      .filter((member) => (member.active !== false || state.role === "admin")
+        && (state.role === "admin" || member.uid !== state.user?.uid))
       .map((member) => ({
         ...member,
         ratingScores: ratingByUid.get(member.uid)?.scores || {},
@@ -2412,13 +3428,30 @@ function attendanceStatusLabel(status) {
   })[status] || status;
 }
 
+function sessionQueriesForMember(base, member) {
+  if (member?.role === "admin") return [base];
+  return [
+    query(base,
+      where("audienceRole", "in", ["all", member.role]),
+      where("audienceUniversityTag", "in", [...new Set(["", member.universityTag || ""])])),
+    query(base, where("audienceRole", "==", "targeted"), where("targetMemberUids", "array-contains", member.uid))
+  ];
+}
+
+function mergeMemberSessions(snapshots, member) {
+  const unique = new Map();
+  snapshots.flatMap((snapshot) => snapshot.docs).forEach((item) => unique.set(item.id, { id: item.id, ...item.data() }));
+  return [...unique.values()]
+    .filter((session) => member?.role === "admin" || isSessionForMember({ ...session, status: "scheduled" }, member));
+}
+
 async function loadAttendanceSessions() {
-  if (state.role !== "admin" || !refs.attendanceSessionSelect) return;
+  if (!canReadAttendance() || !refs.attendanceSessionSelect) return;
   refs.attendanceTableRoot.innerHTML = `<div class="empty-state">Loading NawrasOnline sessions…</div>`;
   try {
-    const snapshot = await getDocs(collection(db, "nawrasOnlineSessions"));
-    state.attendanceSessions = snapshot.docs
-      .map((item) => ({ id: item.id, ...item.data() }))
+    const base = collection(db, "nawrasOnlineSessions");
+    const snapshots = await Promise.all(sessionQueriesForMember(base, state.member).map((ref) => getDocs(ref)));
+    state.attendanceSessions = mergeMemberSessions(snapshots, state.member)
       .sort((a, b) => (attendanceDate(b.startsAt)?.getTime() || 0) - (attendanceDate(a.startsAt)?.getTime() || 0));
     if (!state.attendanceSessions.length) {
       refs.attendanceSessionSelect.innerHTML = `<option value="">No sessions found</option>`;
@@ -2448,7 +3481,7 @@ async function loadAttendanceSessions() {
 }
 
 async function loadAttendanceSession(sessionId) {
-  if (state.role !== "admin" || !sessionId) return;
+  if (!canReadAttendance() || !sessionId) return;
   const session = state.attendanceSessions.find((item) => item.id === sessionId);
   if (!session) return;
   state.attendanceSession = session;
@@ -2570,10 +3603,14 @@ function renderAttendanceRows() {
     </tr>`;
   }).join("");
   refs.attendanceTableRoot.innerHTML = `<div class="answer-table-wrap attendance-table-wrap"><table class="answer-table attendance-table"><thead><tr><th>Participant</th><th>Email</th><th>First entry</th><th>Latest exit</th><th>Total time</th><th>Attendance</th><th>Admin status</th><th>Admin notes</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  if (!canManageAttendance()) {
+    refs.attendanceTableRoot.querySelectorAll("select,textarea").forEach((input) => { input.disabled = true; });
+    refs.attendanceTableRoot.querySelectorAll("[data-attendance-save]").forEach((button) => button.remove());
+  }
 }
 
 async function saveAttendanceOverride(button) {
-  if (state.role !== "admin" || !state.attendanceSession) return showToast("Only admins can change attendance or notes.", "error");
+  if (!canManageAttendance() || !state.attendanceSession) return showToast("Attendance management access is required.", "error");
   const row = button.closest("[data-attendance-row]");
   const uid = button.dataset.attendanceSave;
   const sessionId = state.attendanceSession.id;
@@ -2624,7 +3661,7 @@ function excelRow(values, header = false) {
 }
 
 function exportAttendanceExcel() {
-  if (state.role !== "admin" || !state.attendanceSession) return;
+  if (!canReadAttendance() || !state.attendanceSession) return;
   const session = state.attendanceSession;
   const sessionName = session.title || "NawrasOnline session";
   const now = new Date();
@@ -2705,7 +3742,9 @@ refs.attendanceTableRoot?.addEventListener("click", (event) => {
 refs.exportAttendanceBtn?.addEventListener("click", exportAttendanceExcel);
 
 function leaderboardRole() {
-  return state.role === "admin" ? (state.activeDashboardRole || "admin") : state.role;
+  return state.role === "admin" || currentTeamLeadRoles().includes(state.activeDashboardRole)
+    ? (state.activeDashboardRole || state.role)
+    : state.role;
 }
 
 async function loadLeaderboard() {
@@ -2806,9 +3845,10 @@ function adminTeamAssignmentOptions(value = "") {
   return options.join("");
 }
 
-function canManageMember(member) {
+function canManageMember(member, capability = "") {
   if (state.role === "admin") return true;
   if (!member || member.uid === state.user?.uid || member.active === false || member.role === "admin") return false;
+  if (capability && hasDashboardAccess(capability)) return true;
   const universityScope = state.role === "leaders"
     && Boolean(state.member?.leadingUniversityTag)
     && member.universityTag === state.member.leadingUniversityTag;
@@ -2817,7 +3857,7 @@ function canManageMember(member) {
 }
 
 function xpAdjustmentMarkup(member, className = "grant-xp-form") {
-  if (!canManageMember(member)) return "";
+  if (!canManageMember(member, "xpManage")) return "";
   return `<form class="${className} xp-adjustment-form" data-adjust-xp="${escapeAttr(member.uid)}">
     <label>Change<select name="direction"><option value="add">Add XP</option><option value="subtract">Subtract XP</option></select></label>
     <label>Amount<input name="amount" type="number" min="1" max="100000" step="1" value="50" required></label>
@@ -2832,7 +3872,9 @@ function leaderboardGrantXpMarkup(member) {
 
 function renderTeamMembers() {
   if (!refs.teamMembersList) return;
-  const groups = ROLE_ORDER.map((roleKey) => ({
+  const selectedRoleLead = !canReadAllTeam() && currentTeamLeadRoles().includes(state.activeDashboardRole)
+    ? state.activeDashboardRole : "";
+  const groups = ROLE_ORDER.filter((roleKey) => !selectedRoleLead || roleKey === selectedRoleLead).map((roleKey) => ({
     roleKey,
     members: state.teamMembers.filter((member) => belongsToTeam(member, roleKey))
   })).filter((group) => group.members.length);
@@ -2850,12 +3892,24 @@ function renderTeamMembers() {
         : ["user"];
       const dashboardAssignmentMarkup = `<fieldset class="dashboard-assignment-fieldset" data-dashboard-assignment ${member.role === "user" ? "" : "hidden"}><legend>Dashboard access for this User</legend><div class="dashboard-assignment-options">${ASSIGNABLE_DASHBOARD_ROLES.map((roleKey) => `<label class="check-row"><input type="checkbox" name="dashboardRoles" value="${roleKey}" ${dashboardRoles.includes(roleKey) ? "checked" : ""}><span>${escapeHtml(ROLE_CONFIG[roleKey].label)}</span></label>`).join("")}</div><small>Choose the dashboard views this account can open.</small></fieldset>`;
       const teamLeadRoles = Array.isArray(member.teamLeadRoles) ? member.teamLeadRoles : [];
-      const teamLeadAssignmentMarkup = `<fieldset class="dashboard-assignment-fieldset" data-team-lead-assignment><legend>Team lead access</legend><div class="dashboard-assignment-options">${ASSIGNABLE_DASHBOARD_ROLES.map((roleKey) => `<label class="check-row"><input type="checkbox" name="teamLeadRoles" value="${roleKey}" ${teamLeadRoles.includes(roleKey) ? "checked" : ""}><span>${escapeHtml(ROLE_CONFIG[roleKey].label)}</span></label>`).join("")}</div><small>Team leads can adjust XP and edit ratings for members with the selected role.</small></fieldset>`;
-      const assignmentMarkup = state.role === "admin" ? `<form class="member-assignment-form" data-manage-member="${escapeAttr(member.uid)}">${member.role === "admin" ? `<p class="panel-hint admin-team-assignment-note">Admin access stays global. This assignment identifies the admin’s team and whether they are a member or its leader.</p><label>Admin team assignment<select name="adminTeamAssignment">${adminTeamAssignmentOptions(member.adminTeamAssignment)}</select></label>` : `<label>Account role<select name="role">${roleOptions}</select></label>${dashboardAssignmentMarkup}${teamLeadAssignmentMarkup}`}<label>University<select name="universityTag">${universityOptionsMarkup(member.universityTag)}</select></label>${member.role === "admin" ? "" : `<label data-leading-university ${member.role === "leaders" ? "" : "hidden"}>Leads university<select name="leadingUniversityTag">${universityOptionsMarkup(member.leadingUniversityTag)}</select></label>`}<button class="btn btn-outline btn-compact" type="submit">Save assignments</button></form>` : "";
-      return `<article class="team-member-row"><a class="team-member-identity" href="profile.html?uid=${encodeURIComponent(member.uid)}">${profileAvatarMarkup(member, "large")}<span><strong>${escapeHtml(memberDisplayName(member))}</strong><small>${escapeHtml(role)} · ${member.active === false ? "Inactive" : "Active"}</small></span></a><div class="team-member-stats"><span><strong>${Number(member.xp) || 0}</strong>XP</span><span><strong>${level}</strong>Level</span><span><strong>${Number(member.answersCount) || 0}</strong>Answers</span><span><strong>${Number(member.tasksCompleted) || 0}</strong>Tasks done</span><span class="member-university-stat"><strong>${escapeHtml(member.universityTag || "—")}</strong>${escapeHtml(university?.name || "University")}</span></div><div class="member-admin-controls">${assignmentMarkup}${xpAdjustmentMarkup(member)}</div></article>`;
+       const teamLeadAssignmentMarkup = `<fieldset class="dashboard-assignment-fieldset" data-team-lead-assignment><legend>Position-leader appointments</legend><div class="dashboard-assignment-options">${ASSIGNABLE_DASHBOARD_ROLES.map((roleKey) => `<label class="check-row"><input type="checkbox" name="teamLeadRoles" value="${roleKey}" ${teamLeadRoles.includes(roleKey) ? "checked" : ""}><span>${escapeHtml(ROLE_CONFIG[roleKey].label)}</span></label>`).join("")}</div><small>Leadership positions are separate from the account role.</small></fieldset>`;
+      const assignmentMarkup = member.active !== false && canManageMemberAssignments(member) ? `<form class="member-assignment-form" data-manage-member="${escapeAttr(member.uid)}">${member.role === "admin" ? `<label>Admin team assignment<select name="adminTeamAssignment">${adminTeamAssignmentOptions(member.adminTeamAssignment)}</select></label>` : `<label>Account role<select name="role">${roleOptions}</select></label>${dashboardAssignmentMarkup}${teamLeadAssignmentMarkup}`}<label>University<select name="universityTag">${universityOptionsMarkup(member.universityTag)}</select></label>${member.role === "admin" ? "" : `<label data-leading-university ${member.role === "leaders" ? "" : "hidden"}>Leads university<select name="leadingUniversityTag">${universityOptionsMarkup(member.leadingUniversityTag)}</select><small>If you leave this blank, their University field sets the task scope.</small></label>`}<button class="btn btn-outline btn-compact" type="submit">Save assignments</button></form>` : "";
+      const accountActionButton = state.role === "admin" && member.role !== "admin" && member.uid !== state.user?.uid
+        ? `<button class="btn ${member.active === false ? "btn-outline" : "btn-danger"} btn-compact" type="button" data-toggle-member-active="${escapeAttr(member.uid)}">${member.active === false ? "Reactivate account" : "Deactivate account"}</button>`
+        : "";
+      const accountStatus = member.active === false ? "Inactive" : "Active";
+      return `<article class="team-member-row"><a class="team-member-identity" href="profile.html?uid=${encodeURIComponent(member.uid)}">${profileAvatarMarkup(member, "large")}<span><strong>${escapeHtml(memberDisplayName(member))}</strong><small>${escapeHtml(role)} · ${accountStatus}</small></span></a><div class="team-member-stats"><span><strong>${Number(member.xp) || 0}</strong>XP</span><span><strong>${level}</strong>Level</span><span><strong>${Number(member.answersCount) || 0}</strong>Answers</span><span><strong>${Number(member.tasksCompleted) || 0}</strong>Tasks done</span><span class="member-university-stat"><strong>${escapeHtml(member.universityTag || "—")}</strong>${escapeHtml(university?.name || "University")}</span></div><div class="member-admin-controls">${assignmentMarkup}${member.active === false ? "" : xpAdjustmentMarkup(member)}${accountActionButton}</div></article>`;
     }).join("")}</div></section>`).join("")
     : `<div class="empty-state">No team profiles found.</div>`;
   renderDashboardAccessTarget();
+  refs.teamMembersList.querySelectorAll("form[data-manage-member]").forEach((form) => {
+    const details = document.createElement("details");
+    details.className = "member-assignment-details";
+    const summary = document.createElement("summary");
+    summary.textContent = "Edit assignments";
+    form.replaceWith(details);
+    details.append(summary, form);
+  });
   refs.teamMembersList.querySelectorAll("[data-manage-member]").forEach((form) => form.addEventListener("submit", (event) => {
     event.preventDefault();
     saveMemberAssignments(form.dataset.manageMember, form);
@@ -2873,10 +3927,58 @@ function renderTeamMembers() {
   renderRatingsMatrix();
 }
 
+async function setTeamMemberActive(uid, button) {
+  if (state.role !== "admin" || !uid || uid === state.user?.uid) {
+    return showToast("Only an Admin can change another member's access.", "error");
+  }
+  const member = state.teamMembers.find((item) => item.uid === uid);
+  if (!member || member.role === "admin") {
+    return showToast("This account cannot be changed from the team dashboard.", "error");
+  }
+  const name = memberDisplayName(member);
+  const nextActive = member.active === false;
+  const action = nextActive ? "Reactivate" : "Deactivate";
+  const explanation = nextActive
+    ? `${name} will be able to sign in and use the site again.`
+    : `${name} will lose access to the site, but their sign-in account and saved data will remain. You can reactivate them later.`;
+  if (!window.confirm(`${action} ${name}'s account? ${explanation}`)) return;
+  if (button) {
+    button.disabled = true;
+    button.textContent = nextActive ? "Reactivating…" : "Deactivating…";
+  }
+  try {
+    const latest = await getDoc(doc(db, "teamMembers", uid));
+    if (!latest.exists() || latest.data().role === "admin") {
+      throw new Error("This member account is no longer available for this action.");
+    }
+    await updateDoc(doc(db, "teamMembers", uid), {
+      active: nextActive,
+      updatedAt: serverTimestamp()
+    });
+    state.teamMembers = state.teamMembers.map((item) => item.uid === uid
+      ? { ...item, active: nextActive, updatedAt: new Date() }
+      : item);
+    state.leaderboardMembers = state.leaderboardMembers.map((item) => item.uid === uid
+      ? { ...item, active: nextActive }
+      : item);
+    renderTeamMembers();
+    renderLeaderboard();
+    showToast(nextActive ? `${name}'s account has been reactivated.` : `${name}'s site access has been deactivated.`);
+  } catch (error) {
+    showToast(firebaseError(error), "error");
+    try { await loadTeamMembers(); } catch (_) { /* Keep the original error visible. */ }
+  } finally {
+    if (button?.isConnected) {
+      button.disabled = false;
+      button.textContent = nextActive ? "Reactivate account" : "Deactivate account";
+    }
+  }
+}
+
 async function saveMemberAssignments(uid, form) {
-  if (state.role !== "admin") return showToast("Only admins can edit member assignments.", "error");
   const member = state.teamMembers.find((item) => item.uid === uid);
   if (!member) return;
+  if (!canManageMemberAssignments(member)) return showToast("Member assignment access is required. Admin accounts and your own role are protected.", "error");
   if (member.role === "admin") {
     const adminTeamAssignmentValue = form.querySelector("[name=adminTeamAssignment]")?.value || "";
     if (adminTeamAssignmentValue && !adminTeamAssignment({ role: "admin", adminTeamAssignment: adminTeamAssignmentValue })) {
@@ -2928,7 +4030,7 @@ async function saveMemberAssignments(uid, form) {
   const universityTag = form.querySelector("[name=universityTag]")?.value || "";
   const leadingUniversityTag = nextRole === "leaders"
     ? (form.querySelector("[name=leadingUniversityTag]")?.value || "")
-    : (member.leadingUniversityTag || "");
+    : "";
   if (universityTag && !universityByTag(universityTag)) return showToast("Choose a valid university.", "error");
   if (nextRole === "leaders" && leadingUniversityTag && !universityByTag(leadingUniversityTag)) return showToast("Choose a valid university for this leader.", "error");
   try {
@@ -2937,10 +4039,11 @@ async function saveMemberAssignments(uid, form) {
     const inboxRef = doc(collection(db, "teamMembers", uid, "notifications"));
     await runTransaction(db, async (transaction) => {
       const [snapshot, ratingsSnapshot] = await Promise.all([
-        transaction.get(memberRef), transaction.get(ratingsRef)
+        transaction.get(memberRef), state.role === "admin" ? transaction.get(ratingsRef) : Promise.resolve(null)
       ]);
       if (!snapshot.exists()) throw new Error("This team member no longer exists.");
       const latest = snapshot.data();
+      if (!canManageMemberAssignments({ uid, ...latest })) throw new Error("This account can no longer be managed with your permissions.");
       const latestDashboardRoles = Array.isArray(latest.dashboardRoles) ? latest.dashboardRoles : [];
       const latestTeamLeadRoles = Array.isArray(latest.teamLeadRoles) ? latest.teamLeadRoles : [];
       const assignmentsUnchanged = latest.role === nextRole
@@ -2955,7 +4058,7 @@ async function saveMemberAssignments(uid, form) {
         role: nextRole, dashboardRoles, teamLeadRoles, universityTag, leadingUniversityTag,
         updatedAt: serverTimestamp()
       });
-      if (ratingsSnapshot.exists() && latest.universityTag !== universityTag) {
+      if (ratingsSnapshot?.exists() && latest.universityTag !== universityTag) {
         transaction.update(ratingsRef, {
           universityTag, active: latest.active === true,
           updatedByUid: state.user.uid, updatedAt: serverTimestamp()
@@ -2992,7 +4095,7 @@ async function adjustXp(uid, rawAmount, direction, rawReason) {
   const reason = String(rawReason || "").trim();
   const member = state.teamMembers.find((item) => item.uid === uid)
     || state.leaderboardMembers.find((item) => item.uid === uid);
-  if (!canManageMember(member)) return showToast("You can only adjust XP for members you manage.", "error");
+  if (!canManageMember(member, "xpManage")) return showToast("XP management access is required.", "error");
   if (!Number.isInteger(amount) || amount < 1 || amount > 100000) return showToast("Enter an XP amount from 1 to 100,000.", "error");
   if (!["add", "subtract"].includes(direction)) return showToast("Choose whether to add or subtract XP.", "error");
   if (reason.length < 3) return showToast("Enter a reason for this XP change.", "error");
@@ -3005,7 +4108,7 @@ async function adjustXp(uid, rawAmount, direction, rawReason) {
       const snapshot = await transaction.get(memberRef);
       if (!snapshot.exists()) throw new Error("This team member no longer exists.");
       const latestMember = { uid, ...snapshot.data() };
-      if (!canManageMember(latestMember)) throw new Error("You can only adjust XP for members you manage.");
+      if (!canManageMember(latestMember, "xpManage")) throw new Error("XP management access is required.");
       previousXp = Math.max(0, Number(latestMember.xp) || 0);
       nextXp = direction === "add" ? previousXp + amount : Math.max(0, previousXp - amount);
       if (nextXp === previousXp) throw new Error("This member has no XP to subtract.");
@@ -3035,15 +4138,19 @@ function renderRatingsMatrix() {
   if (!refs.ratingsMatrix) return;
   const roleLeadTargets = currentTeamLeadRoles();
   const isUniversityLeader = state.role === "leaders" && Boolean(universityByTag(state.member?.leadingUniversityTag));
-  const scopedMembers = state.role === "admin"
+  const selectedRoleLead = state.role !== "admin" && currentTeamLeadRoles().includes(state.activeDashboardRole)
+    ? state.activeDashboardRole : "";
+  const scopedMembers = canReadAllRatings()
     ? state.teamMembers
     : state.teamMembers.filter((member) => member.active !== false
       && member.uid !== state.user?.uid
-      && (roleLeadTargets.includes(member.role)
+      && ((selectedRoleLead ? member.role === selectedRoleLead : roleLeadTargets.includes(member.role))
         || (isUniversityLeader && member.universityTag === state.member?.leadingUniversityTag)));
   const adminActions = $("ratingAdminActions");
-  adminActions?.classList.toggle("hidden", state.role !== "admin");
-  if (state.role === "leaders" && !isUniversityLeader && !roleLeadTargets.length) {
+  adminActions?.classList.toggle("hidden", !hasDashboardAccess("xpReset") && !hasDashboardAccess("ratingsReset"));
+  $("resetAllXpBtn")?.classList.toggle("hidden", !hasDashboardAccess("xpReset"));
+  $("resetAllRatingsBtn")?.classList.toggle("hidden", !hasDashboardAccess("ratingsReset"));
+  if (!canReadAllRatings() && state.role === "leaders" && !isUniversityLeader && !roleLeadTargets.length) {
     refs.ratingsMatrix.innerHTML = `<div class="empty-state">An admin must assign your university before you can review ratings.</div>`;
     return;
   }
@@ -3082,6 +4189,10 @@ function renderRatingsMatrix() {
       <div class="rating-save-row"><span>Enter a score and a short note for each category you rate.</span><button type="button" class="btn btn-primary btn-compact" data-save-rating="${escapeAttr(selectedMember.uid)}">Save ratings</button></div>
     </section>
   </div>`;
+  if (!canManageMember(selectedMember, "ratingsManage")) {
+    refs.ratingsMatrix.querySelectorAll("input,textarea").forEach((input) => { input.disabled = true; });
+    refs.ratingsMatrix.querySelector(".rating-save-row")?.remove();
+  }
   refs.ratingsMatrix.querySelectorAll("[data-rating-member-select]").forEach((button) => button.addEventListener("click", () => {
     state.selectedRatingUid = button.dataset.ratingMemberSelect;
     renderRatingsMatrix();
@@ -3122,7 +4233,7 @@ async function loadMyRatings() {
 
 async function saveMemberRatings(uid, row) {
   const member = state.teamMembers.find((item) => item.uid === uid);
-  if (!member || !canManageMember(member)) return showToast("You can only rate members you manage.", "error");
+  if (!member || !canManageMember(member, "ratingsManage")) return showToast("Rating management access is required.", "error");
   const scores = {};
   const notes = {};
   for (const category of RATING_CATEGORIES) {
@@ -3154,7 +4265,7 @@ async function saveMemberRatings(uid, row) {
       ]);
       if (!snapshot.exists()) throw new Error("This team member no longer exists.");
       const latestMember = { uid, ...snapshot.data() };
-      if (!canManageMember(latestMember)) throw new Error("You can only rate members you manage.");
+      if (!canManageMember(latestMember, "ratingsManage")) throw new Error("Rating management access is required.");
       transaction.set(ratingsRef, {
         scores, notes, universityTag: latestMember.universityTag || "",
         active: latestMember.active === true,
@@ -3176,20 +4287,21 @@ async function saveMemberRatings(uid, row) {
 }
 
 async function resetAllMemberValues(kind) {
-  if (state.role !== "admin") return showToast("Only admins can reset scores for the whole team.", "error");
   if (!["xp", "ratings"].includes(kind)) return;
+  if (!hasDashboardAccess(kind === "xp" ? "xpReset" : "ratingsReset")) return showToast("Bulk reset access is required.", "error");
+  const scope = state.role === "admin" ? "every team member" : "all other non-admin members";
   const message = kind === "xp"
-    ? "Reset every team member's XP to 0? Each affected member will receive an inbox record."
-    : "Clear every team member's category scores and notes? Each affected member will receive an inbox record.";
+    ? `Reset XP to 0 for ${scope}? Each affected member will receive an inbox record.`
+    : `Clear category scores and notes for ${scope}? Each affected member will receive an inbox record.`;
   if (!window.confirm(message)) return;
-  const affected = state.teamMembers.filter((member) => kind === "xp"
+  const affected = state.teamMembers.filter((member) => state.role === "admin" || (member.role !== "admin" && member.uid !== state.user?.uid)).filter((member) => kind === "xp"
     ? Number(member.xp) !== 0 || Number(member.level) > 1
     : Object.keys(member.ratingScores || {}).length > 0 || Object.keys(member.ratingNotes || {}).length > 0);
   if (!affected.length) return showToast(kind === "xp" ? "All XP is already at 0." : "All ratings are already clear.");
   try {
-    for (let offset = 0; offset < affected.length; offset += 200) {
+    for (let offset = 0; offset < affected.length; offset += 5) {
       const batch = writeBatch(db);
-      const members = affected.slice(offset, offset + 200);
+      const members = affected.slice(offset, offset + 5);
       members.forEach((member) => {
         const ratingsRef = doc(db, "memberRatings", member.uid);
         const inboxRef = doc(collection(db, "teamMembers", member.uid, "notifications"));
@@ -3199,7 +4311,7 @@ async function resetAllMemberValues(kind) {
           batch.set(inboxRef, inboxNotificationData(
             "xp_reset",
             "Team XP was reset",
-            "An administrator reset the team XP total to 0."
+            "A permitted manager reset your XP total to 0."
           ));
         } else {
           batch.set(ratingsRef, {
@@ -3210,7 +4322,7 @@ async function resetAllMemberValues(kind) {
           batch.set(inboxRef, inboxNotificationData(
             "ratings_reset",
             "Your ratings were reset",
-            "An administrator cleared your category ratings and notes."
+            "A permitted manager cleared your category ratings and notes."
           ));
         }
       });
@@ -3277,6 +4389,540 @@ if (page === "team") {
   window.addEventListener("popstate", renderTeamDirectory);
 }
 
+const PROFILE_ART_STICKERS = Object.freeze(["⭐", "✨", "💡", "📚", "🎨", "🌱", "🚀", "💜", "🌷", "🧡", "🏆", "🪄"]);
+const PROFILE_ART_MAX_ITEMS = 12;
+const PROFILE_STICKER_INVENTORY_MAX = 12;
+const PROFILE_STICKER_MAX_BYTES = 5 * 1024 * 1024;
+const PROFILE_STICKER_TYPES = Object.freeze(["image/png", "image/webp", "image/gif", "image/jpeg"]);
+
+function sanitizePublicProfileArt(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, PROFILE_ART_MAX_ITEMS).map((item, index) => {
+    const kind = ["sticker", "note", "badge", "uploadedSticker"].includes(item?.kind) ? item.kind : "";
+    let text = String(item?.value || "").trim();
+    if (kind === "sticker" && !PROFILE_ART_STICKERS.includes(text)) return null;
+    if (kind === "note") text = text.slice(0, 80);
+    if (kind === "badge") text = text.slice(0, 32);
+    if (kind === "uploadedSticker") text = text.slice(0, 160);
+    if (!kind || !text) return null;
+    const stickerId = /^[a-zA-Z0-9_-]{10,200}$/.test(String(item?.stickerId || ""))
+      ? String(item.stickerId)
+      : "";
+    if (kind === "uploadedSticker" && !stickerId) return null;
+    const id = /^[a-zA-Z0-9_-]{1,40}$/.test(String(item?.id || ""))
+      ? String(item.id)
+      : `profile-art-${index}`;
+    const x = Number.isFinite(Number(item?.x)) ? Number(item.x) : 50;
+    const y = Number.isFinite(Number(item?.y)) ? Number(item.y) : 50;
+    return {
+      id, kind, value: text,
+      ...(kind === "uploadedSticker" ? { stickerId } : {}),
+      x: Math.max(0, Math.min(100, Math.round(x))),
+      y: Math.max(0, Math.min(100, Math.round(y))),
+      rotation: Math.max(-180, Math.min(180, Math.round(Number(item?.rotation) || 0))),
+      scale: Math.max(50, Math.min(200, Math.round(Number(item?.scale) || 100)))
+    };
+  }).filter(Boolean);
+}
+
+function sanitizePublicProfileStickers(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, PROFILE_STICKER_INVENTORY_MAX).filter((item) =>
+    /^[a-zA-Z0-9_-]{10,200}$/.test(String(item?.id || ""))
+    && PROFILE_STICKER_TYPES.includes(item?.mimeType)
+    && String(item?.fileName || "").trim()
+    && Number(item?.sizeBytes) > 0
+    && Number(item?.sizeBytes) <= PROFILE_STICKER_MAX_BYTES
+  ).map((item) => ({
+    id: String(item.id),
+    fileName: String(item.fileName).trim().slice(0, 160),
+    mimeType: item.mimeType,
+    sizeBytes: Math.round(Number(item.sizeBytes)),
+    uploadedAt: String(item.uploadedAt || "").slice(0, 40)
+  }));
+}
+
+function profileStickerInventoryMarkup(inventory, profileUid, previews = new Map()) {
+  if (!inventory.length) return `<p class="profile-sticker-empty">Your Drive stickers will stay here for your next edit.</p>`;
+  return inventory.map((sticker) => {
+    const previewUrl = previews.get(sticker.id) || "";
+    return `<article class="profile-sticker-inventory-item">
+    <img ${previewUrl ? `src="${escapeAttr(previewUrl)}"` : `data-sticker-preview="${escapeAttr(sticker.id)}"`} alt="" loading="lazy">
+    <span title="${escapeAttr(sticker.fileName)}">${escapeHtml(sticker.fileName)}</span>
+    <button type="button" class="btn btn-outline btn-compact" draggable="true" data-add-uploaded-sticker="${escapeAttr(sticker.id)}" title="Drag this sticker onto your profile">Place</button>
+    <button type="button" class="btn btn-danger btn-compact" data-remove-uploaded-sticker="${escapeAttr(sticker.id)}" aria-label="Delete ${escapeAttr(sticker.fileName)} from your sticker inventory">Delete</button>
+  </article>`;
+  }).join("");
+}
+
+function profileArtItemMarkup(item, editable, profileUid = "", previews = new Map()) {
+  const position = `left:${item.x}%;top:${item.y}%;--art-rotation:${item.rotation}deg;--art-scale:${(Number(item.scale) || 100) / 100}`;
+  const content = item.kind === "uploadedSticker"
+    ? `<img class="profile-art-uploaded-image" src="${escapeAttr(previews.get(item.stickerId) || driveProfileStickerUrl(item.stickerId, profileUid))}" alt="${escapeAttr(item.value)}" loading="lazy">`
+    : item.kind === "sticker"
+    ? `<span class="profile-art-sticker" aria-hidden="true">${escapeHtml(item.value)}</span>`
+    : `<span class="profile-art-copy">${escapeHtml(item.value)}</span>`;
+  if (!editable) return `<div class="profile-art-item profile-art-${item.kind}" style="${position}">${content}</div>`;
+  const label = item.kind === "sticker" ? `Move sticker ${item.value}` : item.kind === "uploadedSticker" ? `Move uploaded sticker ${item.value}` : `Move ${item.kind} ${item.value}`;
+  return `<div class="profile-art-item profile-art-${item.kind}" data-profile-art-item="${escapeAttr(item.id)}" style="${position}">
+    <button type="button" class="profile-art-handle" data-profile-art-handle="${escapeAttr(item.id)}" aria-label="${escapeAttr(label)}">${content}</button>
+    <button type="button" class="profile-art-remove" data-profile-art-remove="${escapeAttr(item.id)}" aria-label="Remove ${escapeAttr(item.kind)}">×</button>
+  </div>`;
+}
+
+function profileArtBoardMarkup(items, editable, inventory = [], profileUid = "", profileCard = "") {
+  const tools = editable ? `<div class="profile-art-tools" data-profile-art-tools>
+    <div class="profile-art-tool-group"><strong>Stickers</strong><p>Drag a sticker directly onto any part of your public profile. You can also click to add it, then move it.</p><div class="profile-art-sticker-picker">${PROFILE_ART_STICKERS.map((sticker) => `<button type="button" draggable="true" class="profile-art-sticker-option" data-add-profile-sticker="${escapeAttr(sticker)}" aria-label="Drag or add ${escapeAttr(sticker)}">${escapeHtml(sticker)}</button>`).join("")}</div></div>
+    <div class="profile-sticker-upload"><div class="profile-art-tool-group"><strong>Upload your own sticker</strong><p>PNG, WebP, GIF, or JPEG · up to 5 MB. Uploaded images stay private in Drive and remain in your inventory.</p><div class="profile-sticker-upload-row"><label class="profile-sticker-file-label">Choose image<input type="file" data-profile-sticker-file accept="image/png,image/webp,image/gif,image/jpeg"></label><button type="button" class="btn btn-outline btn-compact" data-upload-profile-sticker>Upload to Drive</button></div><progress data-profile-sticker-progress max="100" value="0" hidden></progress></div><div class="profile-sticker-inventory-heading"><strong>Your sticker inventory</strong><span>${inventory.length}/${PROFILE_STICKER_INVENTORY_MAX}</span></div><div class="profile-sticker-inventory" data-profile-sticker-inventory>${profileStickerInventoryMarkup(inventory, profileUid)}</div></div>
+    <div class="profile-art-inspector" data-profile-art-inspector hidden><div><strong data-profile-art-selected-label>Sticker selected</strong><small>Adjust its size and angle on your profile.</small></div><label>Size <output data-profile-art-scale-output>100%</output><input type="range" data-profile-art-scale min="50" max="200" step="5" value="100"></label><label>Rotation <output data-profile-art-rotation-output>0°</output><input type="range" data-profile-art-rotation min="-180" max="180" step="5" value="0"></label><button type="button" class="btn btn-danger btn-compact" data-remove-selected-profile-art>Remove from page</button></div>
+    <form class="profile-art-text-form" data-profile-art-text-form><label>Add a note or badge<input name="value" type="text" maxlength="80" placeholder="A short phrase for your page" required></label><label>Style<select name="kind"><option value="note">Note card</option><option value="badge">Badge</option></select></label><button class="btn btn-outline btn-compact" type="submit">Add to page</button></form>
+    <div class="profile-art-save-row"><small id="profileArtSaveStatus" role="status" aria-live="polite">Drag any sticker onto the profile above. Select a sticker to change its size or angle, or remove it.</small><div><button type="button" class="btn btn-outline btn-compact" data-clear-profile-art>Clear stickers</button><button type="button" class="btn btn-primary btn-compact" data-save-profile-art>Save profile &amp; stickers</button></div></div>
+  </div>` : "";
+  const composition = editable || items.length ? `<div class="profile-public-composition profile-artboard" data-profile-artboard aria-label="Public profile page">
+    ${profileCard}
+    <div class="profile-art-layer" data-profile-art-layer aria-label="Profile stickers">${items.map((item) => profileArtItemMarkup(item, editable, profileUid)).join("")}</div>
+  </div>` : profileCard;
+  return `${composition}
+  ${editable ? `<section class="public-profile-studio" data-role-theme="${escapeAttr(document.body.dataset.profileRole || "public")}">
+    <div class="public-profile-studio-heading"><div><span class="eyebrow">Your profile studio</span><h2>Make this page yours</h2><p>Place stickers directly on your profile, then drag them into position.</p></div><span class="profile-art-count">${items.length}/${PROFILE_ART_MAX_ITEMS}</span></div>${tools}
+  </section>` : ""}
+  ${editable || items.length ? `<p class="profile-mobile-sticker-note">${editable ? "Profile stickers and editing are available on desktop. Open this page on a computer to arrange and save them." : "Profile stickers are shown on desktop screens. Open this page on a computer to see them."}</p>` : ""}`;
+}
+
+function setupPublicProfileArt(root, profile) {
+  const editor = root.querySelector("[data-profile-art-tools]");
+  const board = root.querySelector("[data-profile-artboard]");
+  const layer = root.querySelector("[data-profile-art-layer]");
+  if (!editor || !board || !layer) return;
+  let items = sanitizePublicProfileArt(profile.publicProfileArt);
+  let inventory = sanitizePublicProfileStickers(profile.publicProfileStickers);
+  const previewUrls = new Map();
+  let dragging = null;
+  let saving = false;
+  let uploadingSticker = false;
+  let deletingSticker = false;
+  let selectedItemId = "";
+  const inspector = editor.querySelector("[data-profile-art-inspector]");
+  window.addEventListener("pagehide", () => {
+    previewUrls.forEach((previewUrl) => URL.revokeObjectURL(previewUrl));
+  }, { once: true });
+
+  const setStatus = (message, error = false) => {
+    const status = root.querySelector("#profileArtSaveStatus");
+    if (!status) return;
+    status.textContent = message;
+    status.classList.toggle("is-error", error);
+  };
+  const markChanged = () => {
+    setStatus("Unsaved changes. Save your design when it looks right.");
+    const save = root.querySelector("[data-save-profile-art]");
+    if (save) save.disabled = false;
+  };
+  const updateInspector = () => {
+    const item = items.find((entry) => entry.id === selectedItemId);
+    if (!inspector) return;
+    inspector.hidden = !item;
+    if (!item) return;
+    const name = item.kind === "uploadedSticker" ? item.value
+      : item.kind === "sticker" ? `Sticker ${item.value}`
+        : `${item.kind === "badge" ? "Badge" : "Note"}: ${item.value}`;
+    const label = inspector.querySelector("[data-profile-art-selected-label]");
+    const scale = inspector.querySelector("[data-profile-art-scale]");
+    const rotation = inspector.querySelector("[data-profile-art-rotation]");
+    const scaleOutput = inspector.querySelector("[data-profile-art-scale-output]");
+    const rotationOutput = inspector.querySelector("[data-profile-art-rotation-output]");
+    if (label) label.textContent = name;
+    if (scale) scale.value = String(item.scale || 100);
+    if (rotation) rotation.value = String(item.rotation || 0);
+    if (scaleOutput) scaleOutput.textContent = `${item.scale || 100}%`;
+    if (rotationOutput) rotationOutput.textContent = `${item.rotation || 0}°`;
+    layer.querySelectorAll("[data-profile-art-item]").forEach((element) => {
+      element.classList.toggle("is-selected", element.dataset.profileArtItem === item.id);
+    });
+  };
+  const render = () => {
+    if (!items.some((item) => item.id === selectedItemId)) selectedItemId = "";
+    layer.innerHTML = items.map((item) => profileArtItemMarkup(item, true, profile.uid, previewUrls)).join("");
+    const count = root.querySelector(".profile-art-count");
+    if (count) count.textContent = `${items.length}/${PROFILE_ART_MAX_ITEMS}`;
+    updateInspector();
+  };
+  const renderInventory = () => {
+    const inventoryRoot = editor.querySelector("[data-profile-sticker-inventory]");
+    const count = editor.querySelector(".profile-sticker-inventory-heading span");
+    if (inventoryRoot) inventoryRoot.innerHTML = profileStickerInventoryMarkup(inventory, profile.uid, previewUrls);
+    if (count) count.textContent = `${inventory.length}/${PROFILE_STICKER_INVENTORY_MAX}`;
+  };
+  const loadInventoryPreviews = async () => {
+    const pending = inventory.filter((sticker) => !previewUrls.has(sticker.id));
+    const failures = [];
+    await Promise.all(pending.map(async (sticker) => {
+      try {
+        const previewUrl = await requestDriveProfileStickerPreview(auth, sticker.id);
+        previewUrls.set(sticker.id, previewUrl);
+      } catch (error) {
+        failures.push(error);
+      }
+    }));
+    renderInventory();
+    render();
+    if (failures.length) {
+      setStatus("Some private Drive stickers could not be previewed. Check that the updated Drive worker is deployed.", true);
+    }
+  };
+  const makeId = () => window.crypto?.randomUUID?.()
+    || `art_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
+  const makeArtItem = (kind, value, placement = null, stickerId = "") => {
+    const maxLength = kind === "sticker" ? 8 : kind === "note" ? 80 : kind === "badge" ? 32 : 160;
+    const text = String(value || "").trim().slice(0, maxLength);
+    if (!text || (kind === "sticker" && !PROFILE_ART_STICKERS.includes(text))) return null;
+    const index = items.length;
+    return {
+      id: makeId(), kind, value: text,
+      ...(kind === "uploadedSticker" ? { stickerId } : {}),
+      x: placement ? Math.max(0, Math.min(100, Math.round(placement.x))) : 24 + (index % 4) * 17,
+      y: placement ? Math.max(0, Math.min(100, Math.round(placement.y))) : 30 + (Math.floor(index / 4) % 3) * 18,
+      rotation: index % 2 ? 4 : -4,
+      scale: 100
+    };
+  };
+  const selectItem = (id) => {
+    selectedItemId = items.some((item) => item.id === id) ? id : "";
+    updateInspector();
+  };
+  const add = (kind, value, placement = null, stickerId = "") => {
+    if (items.length >= PROFILE_ART_MAX_ITEMS) return setStatus(`This page can hold up to ${PROFILE_ART_MAX_ITEMS} items.`, true);
+    const item = makeArtItem(kind, value, placement, stickerId);
+    if (!item) return;
+    items.push(item);
+    selectedItemId = item.id;
+    render();
+    markChanged();
+    return item;
+  };
+  const addUploadedSticker = (sticker, placement = null) => {
+    if (!sticker || items.length >= PROFILE_ART_MAX_ITEMS) return setStatus(`This page can hold up to ${PROFILE_ART_MAX_ITEMS} items. Your upload is still saved in inventory.`, true);
+    return add("uploadedSticker", sticker.fileName, placement, sticker.id);
+  };
+  const moveItem = (item, x, y) => {
+    item.x = Math.max(0, Math.min(100, Math.round(x)));
+    item.y = Math.max(0, Math.min(100, Math.round(y)));
+    const element = layer.querySelector(`[data-profile-art-item="${CSS.escape(item.id)}"]`);
+    if (element) {
+      element.style.left = `${item.x}%`;
+      element.style.top = `${item.y}%`;
+    }
+  };
+  const removePlacedItem = (id) => {
+    items = items.filter((item) => item.id !== id);
+    if (selectedItemId === id) selectedItemId = "";
+    render();
+    markChanged();
+  };
+  const removeUploadedSticker = async (id) => {
+    if (deletingSticker) return;
+    const sticker = inventory.find((item) => item.id === id);
+    if (!sticker || !state.user?.uid || state.user.uid !== profile.uid) return;
+    if (!window.confirm(`Delete “${sticker.fileName}” from your sticker inventory and public profile?`)) return;
+    deletingSticker = true;
+    const deleteButton = editor.querySelector(`[data-remove-uploaded-sticker="${CSS.escape(id)}"]`);
+    if (deleteButton) deleteButton.disabled = true;
+    const nextInventory = inventory.filter((item) => item.id !== id);
+    const nextItems = items.filter((item) => item.stickerId !== id);
+    try {
+      await updateDoc(doc(db, "teamMembers", profile.uid), {
+        publicProfileStickers: nextInventory,
+        publicProfileArt: nextItems.map((item) => ({ ...item })),
+        updatedAt: serverTimestamp()
+      });
+      inventory = nextInventory;
+      items = nextItems;
+      profile.publicProfileStickers = nextInventory;
+      profile.publicProfileArt = nextItems.map((item) => ({ ...item }));
+      if (selectedItemId && !items.some((item) => item.id === selectedItemId)) selectedItemId = "";
+      const previewUrl = previewUrls.get(id);
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      previewUrls.delete(id);
+      render();
+      renderInventory();
+      let driveError = null;
+      try { await retireDriveProfileSticker(auth, id); }
+      catch (error) { driveError = error; }
+      setStatus(driveError
+        ? "Sticker removed from your profile and inventory. Its private Drive copy could not be deleted."
+        : "Sticker removed from your profile, inventory, and Drive.");
+      showToast(driveError
+        ? `Sticker removed from your profile and inventory, but its private Drive copy remains: ${firebaseError(driveError)}`
+        : "Sticker deleted from your profile, inventory, and Drive.", driveError ? "error" : "ok");
+    } catch (error) {
+      const message = uploadedFileId && isProfilePermissionDenied(error)
+        ? "The sticker reached Google Drive, but Firestore denied saving it to your profile. Publish the updated firestore.rules to the Firebase project used by this site, then try again."
+        : profileWriteError(error, "your profile sticker");
+      setStatus(message, true);
+      showToast(message, "error");
+    } finally {
+      deletingSticker = false;
+      renderInventory();
+    }
+  };
+  render();
+  renderInventory();
+  void loadInventoryPreviews();
+
+  editor.addEventListener("click", (event) => {
+    const sticker = event.target.closest("[data-add-profile-sticker]");
+    if (sticker) return add("sticker", sticker.dataset.addProfileSticker);
+    const uploadedSticker = event.target.closest("[data-add-uploaded-sticker]");
+    if (uploadedSticker) {
+      const savedSticker = inventory.find((item) => item.id === uploadedSticker.dataset.addUploadedSticker);
+      if (savedSticker) addUploadedSticker(savedSticker);
+      return;
+    }
+    const removeFromInventory = event.target.closest("[data-remove-uploaded-sticker]");
+    if (removeFromInventory) {
+      void removeUploadedSticker(removeFromInventory.dataset.removeUploadedSticker);
+      return;
+    }
+    if (event.target.closest("[data-remove-selected-profile-art]")) {
+      if (selectedItemId) removePlacedItem(selectedItemId);
+      return;
+    }
+    if (event.target.closest("[data-clear-profile-art]")) {
+      items = [];
+      selectedItemId = "";
+      render();
+      markChanged();
+    }
+  });
+  editor.addEventListener("dragstart", (event) => {
+    const sticker = event.target.closest("[data-add-profile-sticker]");
+    const uploaded = event.target.closest("[data-add-uploaded-sticker]");
+    let payload = null;
+    if (sticker) payload = { kind: "sticker", value: sticker.dataset.addProfileSticker };
+    if (uploaded) {
+      const savedSticker = inventory.find((item) => item.id === uploaded.dataset.addUploadedSticker);
+      if (savedSticker) payload = { kind: "uploadedSticker", stickerId: savedSticker.id };
+    }
+    if (!payload || !event.dataTransfer) return;
+    event.dataTransfer.setData("application/x-nawras-profile-art", JSON.stringify(payload));
+    event.dataTransfer.effectAllowed = "copy";
+  });
+  editor.addEventListener("input", (event) => {
+    const item = items.find((entry) => entry.id === selectedItemId);
+    if (!item) return;
+    const scaleInput = event.target.closest("[data-profile-art-scale]");
+    const rotationInput = event.target.closest("[data-profile-art-rotation]");
+    if (!scaleInput && !rotationInput) return;
+    if (scaleInput) item.scale = Math.max(50, Math.min(200, Math.round(Number(scaleInput.value) || 100)));
+    if (rotationInput) item.rotation = Math.max(-180, Math.min(180, Math.round(Number(rotationInput.value) || 0)));
+    const element = layer.querySelector(`[data-profile-art-item="${CSS.escape(item.id)}"]`);
+    if (element) {
+      element.style.setProperty("--art-scale", String(item.scale / 100));
+      element.style.setProperty("--art-rotation", `${item.rotation}deg`);
+    }
+    const scaleOutput = inspector?.querySelector("[data-profile-art-scale-output]");
+    const rotationOutput = inspector?.querySelector("[data-profile-art-rotation-output]");
+    if (scaleOutput) scaleOutput.textContent = `${item.scale}%`;
+    if (rotationOutput) rotationOutput.textContent = `${item.rotation}°`;
+    markChanged();
+  });
+  editor.querySelector("[data-profile-art-text-form]")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const input = form.querySelector('[name="value"]');
+    const kind = form.querySelector('[name="kind"]')?.value === "badge" ? "badge" : "note";
+    const value = input?.value.trim() || "";
+    if (!value) return;
+    add(kind, value);
+    form.reset();
+  });
+  editor.querySelector("[data-upload-profile-sticker]")?.addEventListener("click", async (event) => {
+    if (uploadingSticker) return;
+    if (!state.user?.uid || state.user.uid !== profile.uid) return showToast("Sign in to upload stickers to your own profile.", "error");
+    if (inventory.length >= PROFILE_STICKER_INVENTORY_MAX) return showToast(`Your inventory can hold up to ${PROFILE_STICKER_INVENTORY_MAX} stickers.`, "error");
+    if (items.length >= PROFILE_ART_MAX_ITEMS) return showToast("Remove a placed item before uploading another sticker to the profile.", "error");
+    const input = editor.querySelector("[data-profile-sticker-file]");
+    const file = input?.files?.[0];
+    if (!file) return showToast("Choose a sticker image from your device first.", "error");
+    if (!PROFILE_STICKER_TYPES.includes(file.type)) return showToast("Use a PNG, WebP, GIF, or JPEG image.", "error");
+    if (file.size > PROFILE_STICKER_MAX_BYTES) return showToast("Profile stickers must be 5 MB or smaller.", "error");
+    if (!isDriveStorageConfigured()) return showToast("Google Drive uploads are not connected yet.", "error");
+    uploadingSticker = true;
+    const button = event.currentTarget;
+    const progress = editor.querySelector("[data-profile-sticker-progress]");
+    button.disabled = true;
+    button.textContent = "Uploading…";
+    if (progress) { progress.hidden = false; progress.value = 0; }
+    let uploadedFileId = "";
+    let stagedPreviewUrl = "";
+    try {
+      const uploaded = await uploadDriveFile(auth, file, {
+        category: "profileSticker",
+        sourceId: profile.uid,
+        sizeBytes: file.size
+      }, {
+        onProgress: (percent) => { if (progress) progress.value = percent; }
+      });
+      if (!uploaded?.id) throw new Error("Google Drive did not return a sticker file ID.");
+      uploadedFileId = uploaded.id;
+      const newSticker = {
+        id: uploaded.id,
+        fileName: String(uploaded.fileName || file.name).slice(0, 160),
+        mimeType: PROFILE_STICKER_TYPES.includes(uploaded.mimeType) ? uploaded.mimeType : file.type,
+        sizeBytes: Math.max(1, Math.min(PROFILE_STICKER_MAX_BYTES, Number(uploaded.sizeBytes) || file.size)),
+        uploadedAt: String(uploaded.uploadedAt || new Date().toISOString()).slice(0, 40)
+      };
+      const nextInventory = [...inventory, newSticker];
+      const newArtItem = makeArtItem("uploadedSticker", newSticker.fileName, null, newSticker.id);
+      if (!newArtItem) throw new Error("The sticker could not be added to your profile.");
+      const nextArt = [...items, newArtItem];
+      try {
+        stagedPreviewUrl = URL.createObjectURL(file);
+        previewUrls.set(newSticker.id, stagedPreviewUrl);
+      } catch (_) { stagedPreviewUrl = ""; }
+      await updateDoc(doc(db, "teamMembers", profile.uid), {
+        publicProfileStickers: nextInventory,
+        publicProfileArt: nextArt,
+        updatedAt: serverTimestamp()
+      });
+      inventory = nextInventory;
+      items = nextArt;
+      selectedItemId = newArtItem.id;
+      profile.publicProfileStickers = nextInventory;
+      profile.publicProfileArt = nextArt.map((item) => ({ ...item }));
+      render();
+      renderInventory();
+      input.value = "";
+      setStatus("Sticker uploaded, placed, and saved to your public profile.");
+      showToast("Sticker uploaded and saved to your public profile.");
+    } catch (error) {
+      if (uploadedFileId && !inventory.some((item) => item.id === uploadedFileId)) {
+        try { await retireDriveProfileSticker(auth, uploadedFileId); } catch (_) { /* Keep the upload error as the useful message. */ }
+        const previewUrl = previewUrls.get(uploadedFileId) || stagedPreviewUrl;
+        if (previewUrl) URL.revokeObjectURL(previewUrl);
+        previewUrls.delete(uploadedFileId);
+      }
+      const message = firebaseError(error);
+      setStatus(message, true);
+      showToast(message, "error");
+    } finally {
+      uploadingSticker = false;
+      button.disabled = false;
+      button.textContent = "Upload to Drive";
+      if (progress) progress.hidden = true;
+    }
+  });
+  board.addEventListener("pointerdown", (event) => {
+    const handle = event.target.closest("[data-profile-art-handle]");
+    if (!handle || event.button !== 0) return;
+    const item = items.find((entry) => entry.id === handle.dataset.profileArtHandle);
+    if (!item) return;
+    event.preventDefault();
+    selectItem(item.id);
+    const bounds = board.getBoundingClientRect();
+    dragging = { id: item.id, pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, x: item.x, y: item.y, bounds };
+    handle.setPointerCapture?.(event.pointerId);
+    board.classList.add("is-dragging");
+  });
+  board.addEventListener("pointermove", (event) => {
+    if (!dragging || event.pointerId !== dragging.pointerId) return;
+    const item = items.find((entry) => entry.id === dragging.id);
+    if (!item || !dragging.bounds.width || !dragging.bounds.height) return;
+    const nextX = dragging.x + (event.clientX - dragging.startX) / dragging.bounds.width * 100;
+    const nextY = dragging.y + (event.clientY - dragging.startY) / dragging.bounds.height * 100;
+    moveItem(item, nextX, nextY);
+  });
+  const endDrag = (event) => {
+    if (!dragging || (event?.pointerId !== undefined && event.pointerId !== dragging.pointerId)) return;
+    dragging = null;
+    board.classList.remove("is-dragging");
+    markChanged();
+  };
+  board.addEventListener("pointerup", endDrag);
+  board.addEventListener("pointercancel", endDrag);
+  board.addEventListener("click", (event) => {
+    const remove = event.target.closest("[data-profile-art-remove]");
+    if (remove) {
+      removePlacedItem(remove.dataset.profileArtRemove);
+      return;
+    }
+    const handle = event.target.closest("[data-profile-art-handle]");
+    if (handle) selectItem(handle.dataset.profileArtHandle);
+  });
+  board.addEventListener("dragover", (event) => {
+    if (![...(event.dataTransfer?.types || [])].includes("application/x-nawras-profile-art")) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+    board.classList.add("is-drop-target");
+  });
+  board.addEventListener("dragleave", (event) => {
+    if (event.relatedTarget && board.contains(event.relatedTarget)) return;
+    board.classList.remove("is-drop-target");
+  });
+  board.addEventListener("drop", (event) => {
+    board.classList.remove("is-drop-target");
+    const raw = event.dataTransfer?.getData("application/x-nawras-profile-art") || "";
+    if (!raw) return;
+    event.preventDefault();
+    let payload;
+    try { payload = JSON.parse(raw); } catch (_) { return; }
+    const bounds = board.getBoundingClientRect();
+    if (!bounds.width || !bounds.height) return;
+    const placement = {
+      x: (event.clientX - bounds.left) / bounds.width * 100,
+      y: (event.clientY - bounds.top) / bounds.height * 100
+    };
+    if (payload.kind === "sticker" && PROFILE_ART_STICKERS.includes(payload.value)) {
+      add("sticker", payload.value, placement);
+    } else if (payload.kind === "uploadedSticker") {
+      const sticker = inventory.find((item) => item.id === payload.stickerId);
+      if (sticker) addUploadedSticker(sticker, placement);
+    }
+  });
+  board.addEventListener("keydown", (event) => {
+    const handle = event.target.closest("[data-profile-art-handle]");
+    if (!handle) return;
+    const item = items.find((entry) => entry.id === handle.dataset.profileArtHandle);
+    if (!item) return;
+    if (event.key === "Delete" || event.key === "Backspace") {
+      event.preventDefault();
+      removePlacedItem(item.id);
+      return;
+    }
+    const step = event.shiftKey ? 8 : 3;
+    const moves = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
+    if (!moves[event.key]) return;
+    event.preventDefault();
+    moveItem(item, item.x + moves[event.key][0], item.y + moves[event.key][1]);
+    markChanged();
+  });
+  editor.querySelector("[data-save-profile-art]")?.addEventListener("click", async (event) => {
+    if (saving) return;
+    if (!state.user?.uid || state.user.uid !== profile.uid) return showToast("Sign in to edit your own public profile.", "error");
+    saving = true;
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = "Saving…";
+    try {
+      await updateDoc(doc(db, "teamMembers", profile.uid), {
+        publicProfileArt: items.map((item) => ({ ...item })),
+        updatedAt: serverTimestamp()
+      });
+      profile.publicProfileArt = items.map((item) => ({ ...item }));
+      setStatus("Your public profile design is saved.");
+      showToast("Your public profile design is saved.");
+    } catch (error) {
+      const message = profileWriteError(error, "your profile design");
+      setStatus(message, true);
+      showToast(message, "error");
+    } finally {
+      saving = false;
+      button.disabled = false;
+      button.textContent = "Save profile & stickers";
+    }
+  });
+}
+
 async function loadProfilePage(uid) {
   const root = $("profilePage");
   if (!root || !uid) return;
@@ -3285,12 +4931,18 @@ async function loadProfilePage(uid) {
     if (!snapshot.exists() || snapshot.data().active === false) throw new Error("This profile is not available.");
     const profile = { uid, ...snapshot.data() };
     const themeRole = ROLE_ART[profile.role] ? profile.role : "public";
+    document.body.dataset.profileRole = themeRole;
     const name = memberDisplayName(profile);
     const level = levelForXp(profile.xp);
-    root.innerHTML = `<div class="profile-public-card" data-role-theme="${themeRole}">${profileAvatarMarkup(profile, "hero")}<div class="profile-public-copy"><span class="eyebrow">${escapeHtml(ROLE_CONFIG[profile.role]?.label || "NAWRAS team")}</span><h1>${escapeHtml(name)}</h1><p>${escapeHtml(profile.bio || "A NAWRAS EDU team member helping the community learn and grow.")}</p><div class="profile-university-tag">${escapeHtml(universityLabel(profile.universityTag))}</div><div class="profile-stat-row"><span><strong>${level}</strong>Level</span><span><strong>${Number(profile.xp) || 0}</strong>XP</span><span><strong>${Number(profile.answersCount) || 0}</strong>Answers</span><span><strong>${Number(profile.tasksCompleted) || 0}</strong>Tasks done</span></div></div></div>`;
+    const editable = Boolean(state.user && !state.user.isAnonymous && state.user.uid === uid);
+    const art = sanitizePublicProfileArt(profile.publicProfileArt);
+    const stickerInventory = sanitizePublicProfileStickers(profile.publicProfileStickers);
+    const profileCard = `<div class="profile-public-card" data-role-theme="${themeRole}">${profileAvatarMarkup(profile, "hero")}<div class="profile-public-copy"><span class="eyebrow">${escapeHtml(ROLE_CONFIG[profile.role]?.label || "NAWRAS team")}</span><h1>${escapeHtml(name)}</h1><p>${escapeHtml(profile.bio || "A NAWRAS EDU team member helping the community learn and grow.")}</p><div class="profile-university-tag">${escapeHtml(universityLabel(profile.universityTag))}</div><div class="profile-stat-row"><span><strong>${level}</strong>Level</span><span><strong>${Number(profile.xp) || 0}</strong>XP</span><span><strong>${Number(profile.answersCount) || 0}</strong>Answers</span><span><strong>${Number(profile.tasksCompleted) || 0}</strong>Tasks done</span></div></div></div>`;
+    root.innerHTML = profileArtBoardMarkup(art, editable, stickerInventory, profile.uid, profileCard);
     root.querySelector(".profile-public-copy")?.insertAdjacentHTML("beforeend", socialLinksMarkup(profile.socialLinks));
     document.body.dataset.profileRole = themeRole;
     decorateRoleSurface(root.querySelector(".profile-public-card"), themeRole);
+    if (editable) setupPublicProfileArt(root, profile);
   } catch (error) {
     document.body.removeAttribute("data-profile-role");
     root.innerHTML = `<div class="empty-state">${escapeHtml(error?.message || "This profile could not be loaded.")}</div>`;
@@ -3311,7 +4963,7 @@ async function saveCourse(event) {
   const ctaUrl = normalizeHttpUrl(ctaUrlInput);
   const imageUrl = extractImageUrl($("courseImageInput").value.trim());
   const published = $("coursePublished").checked;
-  const assets = readCourseAssets();
+  let assets = readCourseAssets();
   if (!assets) return;
   if (!title || !description) return showToast("Course title and description are required.", "error");
   if (Boolean(ctaText) !== Boolean(ctaUrlInput)) return showToast("Enter both the custom button text and its URL, or leave both blank.", "error");
@@ -3321,13 +4973,14 @@ async function saveCourse(event) {
   const existingCourse = id ? state.courses.find((course) => course.id === id) : null;
   const currentAssignments = state.courseAssignments.filter((assignment) => assignment.courseId === id);
   const currentMemberUids = currentAssignments.map((assignment) => assignment.memberUid);
-  const assignedMemberUids = state.role === "admin"
+  const assignedMemberUids = canManageCourses()
     ? selectedCourseAssignees()
     : (Array.isArray(existingCourse?.assignedMemberUids) ? existingCourse.assignedMemberUids : currentMemberUids);
   if (assignedMemberUids.length > 100) return showToast("Assign a course to no more than 100 members.", "error");
   try {
     const courseRef = id ? doc(db, "courses", id) : doc(collection(db, "courses"));
     const courseId = courseRef.id;
+    assets = await uploadPendingCourseAssets(assets, courseId);
     const courseSettings = {
       title,
       description,
@@ -3347,7 +5000,7 @@ async function saveCourse(event) {
       batch.set(courseRef, { ...courseSettings, createdAt: serverTimestamp(), updatedAt: serverTimestamp(), createdBy: state.user.uid });
     }
     batch.set(doc(db, "coursePrivate", courseId), { assets });
-    if (state.role === "admin") {
+    if (canManageCourses()) {
       const previous = new Set(currentMemberUids);
       const selected = new Set(assignedMemberUids);
       for (const memberUid of selected) {
@@ -3365,7 +5018,7 @@ async function saveCourse(event) {
     }
     await batch.commit();
     let notificationError = null;
-    if (state.role === "admin") {
+    if (canManageCourses()) {
       const previousSet = new Set(currentMemberUids);
       const nextSet = new Set(assignedMemberUids);
       const addedUids = [...nextSet].filter((memberUid) => !previousSet.has(memberUid));
@@ -3405,6 +5058,38 @@ async function saveCourse(event) {
   } catch (error) {
     showToast(firebaseError(error), "error");
   }
+}
+
+async function uploadPendingCourseAssets(assets, courseId) {
+  const result = [];
+  for (const asset of assets) {
+    if (!asset.file) {
+      const { row, file, ...savedAsset } = asset;
+      result.push(savedAsset);
+      continue;
+    }
+    const progress = asset.row?.querySelector("[data-course-asset-progress]");
+    if (progress) { progress.hidden = false; progress.value = 0; }
+    const uploaded = await uploadDriveFile(auth, asset.file, {
+      category: "courseAsset",
+      sourceId: courseId,
+      sizeBytes: asset.file.size
+    }, {
+      onProgress: (percent) => { if (progress) progress.value = percent; }
+    });
+    result.push({
+      title: asset.title,
+      kind: asset.kind,
+      url: "",
+      driveFileId: uploaded.id,
+      driveFileName: uploaded.fileName,
+      driveMimeType: uploaded.mimeType,
+      driveSizeBytes: uploaded.sizeBytes,
+      driveUploadedByUid: state.user.uid,
+      driveUploadedAt: uploaded.uploadedAt || new Date().toISOString()
+    });
+  }
+  return result;
 }
 
 function formAudienceType(form) {
@@ -3710,7 +5395,7 @@ function openCourseEditor(course = null) {
   }
   renderCourseAssetRows(course?.assets || []);
   renderCourseAssignees(assignedMemberUids);
-  $("courseAssignmentField")?.classList.toggle("hidden", state.role !== "admin");
+  $("courseAssignmentField")?.classList.toggle("hidden", !canManageCourses());
   openModal("courseModal");
 }
 
@@ -3722,7 +5407,7 @@ function resetCourseForm() {
   $("coursePublished").checked = true;
   renderCourseAssetRows([]);
   renderCourseAssignees([]);
-  $("courseAssignmentField")?.classList.toggle("hidden", state.role !== "admin");
+  $("courseAssignmentField")?.classList.toggle("hidden", !canManageCourses());
 }
 
 function courseAssetRowMarkup(asset = {}) {
@@ -3734,11 +5419,19 @@ function courseAssetRowMarkup(asset = {}) {
     ["link", "Other link"]
   ];
   const selectedKind = kinds.some(([kind]) => kind === asset.kind) ? asset.kind : "video";
-  return `<div class="course-asset-row" data-course-asset-row>
+  return `<div class="course-asset-row" data-course-asset-row
+    data-drive-file-id="${escapeAttr(asset.driveFileId || "")}"
+    data-drive-file-name="${escapeAttr(asset.driveFileName || "")}"
+    data-drive-mime-type="${escapeAttr(asset.driveMimeType || "")}"
+    data-drive-size-bytes="${escapeAttr(asset.driveSizeBytes || "")}"
+    data-drive-uploaded-by-uid="${escapeAttr(asset.driveUploadedByUid || "")}"
+    data-drive-uploaded-at="${escapeAttr(asset.driveUploadedAt || "")}">
     <div class="course-asset-fields">
       <label>Lesson or material title<input type="text" data-course-asset-title maxlength="100" value="${escapeAttr(asset.title || "")}" placeholder="Session 1 — Introduction" required></label>
       <label>Type<select data-course-asset-kind>${kinds.map(([kind, label]) => `<option value="${kind}" ${kind === selectedKind ? "selected" : ""}>${label}</option>`).join("")}</select></label>
-      <label class="course-asset-url">Resource URL<input type="url" data-course-asset-url maxlength="1500" value="${escapeAttr(asset.url || "")}" placeholder="https://drive.google.com/file/d/..." required></label>
+      <label class="course-asset-url">Resource URL<input type="url" data-course-asset-url maxlength="1500" value="${escapeAttr(asset.url || "")}" placeholder="Paste a public link, or upload a private Drive file"></label>
+      <label class="course-asset-file">Upload a private file<input type="file" data-course-asset-file accept="image/jpeg,image/png,image/webp,video/mp4,video/webm,application/pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv"><small data-course-asset-existing>${escapeHtml(asset.driveFileName ? `Current Drive file: ${asset.driveFileName}` : "Upload replaces the link above for this lesson.")}</small></label>
+      <progress class="drive-upload-progress" data-course-asset-progress max="100" value="0" hidden></progress>
       <button class="btn btn-danger btn-compact" type="button" data-remove-course-asset>Remove</button>
     </div>
   </div>`;
@@ -3780,11 +5473,22 @@ function readCourseAssets() {
     const title = row.querySelector("[data-course-asset-title]")?.value.trim() || "";
     const kind = row.querySelector("[data-course-asset-kind]")?.value || "video";
     const url = normalizeHttpUrl(row.querySelector("[data-course-asset-url]")?.value.trim() || "");
-    if (!title || !url) {
-      showToast("Each lesson or material needs a title and a valid http(s) URL.", "error");
+    const file = row.querySelector("[data-course-asset-file]")?.files?.[0] || null;
+    const driveFileId = row.dataset.driveFileId || "";
+    if (!title || (!url && !file && !driveFileId)) {
+      showToast("Each lesson or material needs a title and either a link or an uploaded file.", "error");
       return null;
     }
-    assets.push({ title, kind, url });
+    assets.push({
+      title, kind, url: file ? "" : url,
+      driveFileId: file ? "" : driveFileId,
+      driveFileName: file ? "" : row.dataset.driveFileName || "",
+      driveMimeType: file ? "" : row.dataset.driveMimeType || "",
+      driveSizeBytes: file ? 0 : Number(row.dataset.driveSizeBytes) || 0,
+      driveUploadedByUid: file ? "" : row.dataset.driveUploadedByUid || "",
+      driveUploadedAt: file ? "" : row.dataset.driveUploadedAt || "",
+      file, row
+    });
   }
   return assets;
 }
@@ -4420,7 +6124,8 @@ function openCourseDetails(id) {
     && (canReadCourses() || canManageContent() || isAssignedToCurrentMember);
   const assets = canViewPrivateCourseContent && Array.isArray(course.assets)
     ? course.assets.filter((asset) =>
-      asset && typeof asset.title === "string" && typeof asset.url === "string" && normalizeHttpUrl(asset.url)
+      asset && typeof asset.title === "string"
+      && ((typeof asset.url === "string" && normalizeHttpUrl(asset.url)) || Boolean(asset.driveFileId))
     )
     : [];
   const buttons = [
@@ -4462,7 +6167,18 @@ function openCourseDetails(id) {
       item.setAttribute("aria-pressed", String(selected));
     });
     previewPanel.innerHTML = courseAssetMarkup(asset);
+    const drivePreviewButton = previewPanel.querySelector("[data-preview-course-drive]");
+    drivePreviewButton?.addEventListener("click", () => {
+      void openDrivePreview("courseAsset", course.id, asset.driveFileId, asset.title, asset.driveMimeType || "");
+    });
   }));
+  const firstDrivePreviewButton = previewPanel?.querySelector("[data-preview-course-drive]");
+  if (firstDrivePreviewButton) {
+    const firstAsset = assets[0];
+    firstDrivePreviewButton.addEventListener("click", () => {
+      void openDrivePreview("courseAsset", course.id, firstAsset.driveFileId, firstAsset.title, firstAsset.driveMimeType || "");
+    });
+  }
   modal.setAttribute("aria-labelledby", "publicCourseTitle");
   openModal("publicCourseModal");
 }
@@ -4518,17 +6234,82 @@ function courseAssetButtonMarkup(asset, index) {
   </button>`;
 }
 
+function ensureDrivePreviewModal() {
+  let modal = $("drivePreviewModal");
+  if (!modal) {
+    modal = document.createElement("div");
+    modal.id = "drivePreviewModal";
+    modal.className = "modal hidden drive-preview-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.innerHTML = `<div class="modal-backdrop" data-close-modal="drivePreviewModal"></div><div class="modal-card modal-wide drive-preview-card"><button class="modal-close" type="button" data-close-modal="drivePreviewModal" aria-label="Close preview">×</button><span class="eyebrow" id="drivePreviewType">Google Drive</span><h2 id="drivePreviewTitle">Resource preview</h2><div id="drivePreviewBody" class="drive-preview-body"></div></div>`;
+    document.body.appendChild(modal);
+  }
+  return modal;
+}
+
+function closeDrivePreview() {
+  const body = $("drivePreviewBody");
+  if (body) body.replaceChildren();
+  closeModal("drivePreviewModal");
+}
+
+function openLegacyDrivePreview(url, title) {
+  const previewUrl = googleDrivePreviewUrl(url);
+  if (!previewUrl) return showToast("This Drive link cannot be previewed. Check the file link.", "error");
+  ensureDrivePreviewModal();
+  $("drivePreviewTitle").textContent = title || "Resource preview";
+  $("drivePreviewType").textContent = "Existing Google Drive link";
+  $("drivePreviewBody").innerHTML = `<div class="drive-preview-stage"><iframe class="drive-preview-frame" src="${escapeAttr(previewUrl)}" title="${escapeAttr(title || "Google Drive file")}" loading="lazy" referrerpolicy="no-referrer"></iframe></div><div class="drive-preview-footer"><span>Uses the current Google Drive sharing settings.</span><a class="btn btn-outline btn-compact" href="${escapeAttr(url)}" target="_blank" rel="noopener noreferrer">Open in Drive ↗</a></div>`;
+  openModal("drivePreviewModal");
+}
+
+async function openDrivePreview(sourceType, sourceId, fileId, title, mimeType = "") {
+  const modal = ensureDrivePreviewModal();
+  $("drivePreviewTitle").textContent = title || "Resource preview";
+  $("drivePreviewType").textContent = mimeType.startsWith("video/") ? "Video"
+    : mimeType.startsWith("image/") ? "Image"
+      : mimeType === "application/pdf" || mimeType.startsWith("application/vnd.google-apps.") ? "Document"
+        : "File";
+  $("drivePreviewBody").innerHTML = `<div class="empty-state" role="status">Checking access and loading the file…</div>`;
+  openModal("drivePreviewModal");
+  try {
+    const ticket = await requestDrivePreviewTicket(auth, sourceType, sourceId, fileId);
+    const mime = ticket.mimeType || mimeType || "";
+    const resourceName = ticket.fileName || title || "Academy resource";
+    const url = ticket.url;
+    let content = "";
+    if (mime.startsWith("video/")) {
+      content = `<video class="drive-preview-media" controls playsinline preload="metadata" src="${escapeAttr(url)}"></video>`;
+    } else if (mime.startsWith("image/")) {
+      content = `<img class="drive-preview-image" src="${escapeAttr(url)}" alt="${escapeAttr(resourceName)}" referrerpolicy="no-referrer">`;
+    } else if (mime === "application/pdf" || mime.startsWith("application/vnd.google-apps.")) {
+      content = `<iframe class="drive-preview-frame" src="${escapeAttr(url)}" title="${escapeAttr(resourceName)}" loading="lazy" referrerpolicy="no-referrer"></iframe>`;
+    } else if (mime.startsWith("text/")) {
+      content = `<iframe class="drive-preview-frame" src="${escapeAttr(url)}" title="${escapeAttr(resourceName)}" loading="lazy" referrerpolicy="no-referrer"></iframe>`;
+    } else {
+      content = `<div class="drive-preview-download"><span class="drive-preview-file-icon" aria-hidden="true">${materialIcon("description")}</span><strong>${escapeHtml(resourceName)}</strong><p>This file type opens as a download. It remains private and this link expires after one hour.</p></div>`;
+    }
+    $("drivePreviewBody").innerHTML = `<div class="drive-preview-stage">${content}</div><div class="drive-preview-footer"><span>${escapeHtml(resourceName)}</span><a class="btn btn-outline btn-compact" href="${escapeAttr(url)}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" download>Open or download</a></div>`;
+  } catch (error) {
+    $("drivePreviewBody").innerHTML = `<div class="empty-state drive-preview-error">${escapeHtml(error.message || "This file could not be opened.")}</div>`;
+  }
+}
+
 function googleDrivePreviewUrl(value) {
   const normalized = normalizeHttpUrl(value);
   if (!normalized) return "";
   try {
     const url = new URL(normalized);
     if (!["drive.google.com", "docs.google.com"].includes(url.hostname.toLowerCase())) return "";
-    const fileId = url.pathname.match(/\/(?:file|document|spreadsheets|presentation)\/d\/([^/]+)/i)?.[1]
+    const fileId = url.pathname.match(/\/(?:file|document|spreadsheets|presentation|drawings)(?:\/u\/\d+)?\/d\/([^/]+)/i)?.[1]
       || url.searchParams.get("id")
       || "";
     if (!fileId || !/^[a-zA-Z0-9_-]+$/.test(fileId)) return "";
-    return `https://drive.google.com/file/d/${encodeURIComponent(fileId)}/preview`;
+    const preview = new URL(`https://drive.google.com/file/d/${encodeURIComponent(fileId)}/preview`);
+    const resourceKey = url.searchParams.get("resourcekey");
+    if (resourceKey && /^[a-zA-Z0-9_-]+$/.test(resourceKey)) preview.searchParams.set("resourcekey", resourceKey);
+    return preview.href;
   } catch (_) {
     return "";
   }
@@ -4597,6 +6378,12 @@ function courseAssetPreviewContent(asset, url) {
 
 function courseAssetMarkup(asset) {
   const url = normalizeHttpUrl(asset.url);
+  if (asset.driveFileId) {
+    return `<article class="course-active-resource">
+      <header class="course-active-resource-header"><div><span class="course-active-resource-kind">${escapeHtml(courseAssetKindLabel(asset.kind))}</span><h3>${escapeHtml(asset.title)}</h3></div><button class="btn btn-outline btn-compact course-resource-open" type="button" data-preview-course-drive="${escapeAttr(asset.driveFileId)}">Preview file</button></header>
+      <div class="course-preview-unavailable"><span class="course-preview-unavailable-icon" aria-hidden="true">${materialIcon(courseAssetIcon(asset.kind))}</span><strong>${escapeHtml(asset.driveFileName || "Private course resource")}</strong><p>Open the protected in-site preview to view this course file.</p></div>
+    </article>`;
+  }
   if (!url) return "";
   return `<article class="course-active-resource">
     <header class="course-active-resource-header"><div><span class="course-active-resource-kind">${escapeHtml(courseAssetKindLabel(asset.kind))}</span><h3>${escapeHtml(asset.title)}</h3></div><a class="btn btn-outline btn-compact course-resource-open" href="${escapeAttr(url)}" target="_blank" rel="noopener noreferrer">Open original ↗</a></header>
@@ -4682,6 +6469,17 @@ function renderTeamForms(items) {
   refs.teamFormsList.querySelectorAll("[data-view-answers]").forEach((button) => button.addEventListener("click", () => viewAnswers(button.dataset.viewAnswers)));
   refs.teamFormsList.querySelectorAll("[data-edit-form]").forEach((button) => button.addEventListener("click", () => openFormEditor(state.forms.find((item) => item.id === button.dataset.editForm))));
   refs.teamFormsList.querySelectorAll("[data-publish-form]").forEach((button) => button.addEventListener("click", () => publishForm(button.dataset.publishForm)));
+  if (canManageForms()) refs.teamFormsList.querySelectorAll("[data-edit-form]").forEach((button) => {
+    const actions = button.closest(".admin-actions");
+    if (!actions.querySelector("[data-delete-form]")) {
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "btn btn-danger btn-compact";
+      remove.dataset.deleteForm = button.dataset.editForm;
+      remove.textContent = "Delete";
+      actions.appendChild(remove);
+    }
+  });
   refs.teamFormsList.querySelectorAll("[data-delete-form]").forEach((button) => button.addEventListener("click", () => deleteForm(button.dataset.deleteForm)));
 }
 
@@ -5030,12 +6828,22 @@ function safeFilename(value) { return String(value || "form").replace(/[^a-z0-9-
 function csvEscape(value) { const text = String(value ?? ""); return /[",\n]/.test(text) ? `"${text.replace(/"/g, "\"\"")}"` : text; }
 function friendlyAuthError(error) { return ({ "auth/invalid-credential": "Email or password is incorrect.", "auth/invalid-email": "Enter a valid email address.", "auth/too-many-requests": "Too many attempts. Try again later.", "auth/user-not-found": "No Firebase account was found for this email.", "auth/wrong-password": "Email or password is incorrect.", "auth/email-already-in-use": "An account already exists with this email. Try signing in instead.", "auth/weak-password": "Choose a stronger password with at least 8 characters.", "auth/operation-not-allowed": "Email and password registration is disabled. Enable Email/Password in Firebase Authentication settings.", "auth/network-request-failed": "Network error. Check your connection and try again." })[error?.code] || error?.message || "Authentication failed."; }
 function firebaseError(error) { return error?.message || "Firebase operation failed."; }
+function isProfilePermissionDenied(error) {
+  return ["permission-denied", "firestore/permission-denied"].includes(String(error?.code || ""))
+    || /missing or insufficient permissions/i.test(String(error?.message || ""));
+}
+function profileWriteError(error, subject) {
+  return isProfilePermissionDenied(error)
+    ? `Firestore denied saving ${subject}. Publish the latest firestore.rules to the same Firebase project used by this site.`
+    : firebaseError(error);
+}
 
 let draggedDashboardPanel = null;
 const DASHBOARD_PANEL_IDS = {
   roleWorkspace: "role-workspace",
-  designerResourcesPanel: "designer-resources",
+  designerResourcesPanel: "role-resources",
   profilePanel: "profile",
+  crossTeamWorkPanel: "cross-team-work",
   memberInboxPanel: "inbox",
   memberFormsPanel: "member-forms",
   leaderboardPanel: "leaderboard",
@@ -5045,6 +6853,7 @@ const DASHBOARD_PANEL_IDS = {
   dashboardAccessPanel: "dashboard-access",
   ratingsPanel: "ratings",
   attendancePanel: "attendance",
+  sessionsPanel: "sessions",
   chatPanel: "chat",
   sharedManagement: "management"
 };
@@ -5151,24 +6960,26 @@ function technicalMaterialKindIcon(kind) {
 function normalizeGoogleDriveMaterialUrl(value) {
   const normalized = normalizeHttpUrl(value);
   if (!normalized) return "";
-  try {
-    const url = new URL(normalized);
-    if (url.protocol !== "https:" || !["drive.google.com", "docs.google.com"].includes(url.hostname.toLowerCase())) return "";
-    return googleDrivePreviewUrl(normalized) ? normalized : "";
-  } catch (_) {
-    return "";
-  }
+  const url = new URL(normalized);
+  // A valid sharing link need not be embeddable (for example, a Drive folder).
+  return url.protocol === "https:" && ["drive.google.com", "docs.google.com"].includes(url.hostname.toLowerCase())
+    && (url.pathname !== "/" || url.search) ? normalized : "";
 }
 
 function technicalMaterialCardMarkup(material) {
   const label = technicalMaterialKindLabel(material.kind);
   const driveUrl = normalizeGoogleDriveMaterialUrl(material.url);
+  const embeddedDriveUrl = driveUrl ? googleDrivePreviewUrl(driveUrl) : "";
   const adminAction = canManageTechnicalMaterials()
-    ? `<button class="btn btn-danger btn-compact" type="button" data-delete-technical-material="${escapeAttr(material.id)}">Delete</button>`
+    ? `<button class="btn btn-outline btn-compact" type="button" data-edit-technical-material="${escapeAttr(material.id)}">Edit</button><button class="btn btn-danger btn-compact" type="button" data-delete-technical-material="${escapeAttr(material.id)}">Delete</button>`
     : "";
   const previewLabel = ["video", "lecture"].includes(material.kind) ? "Watch here" : "Preview here";
-  const resourceActions = driveUrl
-    ? `<button class="btn btn-primary btn-compact" type="button" data-preview-technical-material="${escapeAttr(material.id)}">${previewLabel}</button><a class="btn btn-outline btn-compact" href="${escapeAttr(driveUrl)}" target="_blank" rel="noopener noreferrer">Open in Drive ↗</a>`
+  const resourceActions = material.driveFileId
+    ? `<button class="btn btn-primary btn-compact" type="button" data-preview-technical-material="${escapeAttr(material.id)}">${previewLabel}</button>`
+    : embeddedDriveUrl
+      ? `<button class="btn btn-primary btn-compact" type="button" data-preview-technical-material="${escapeAttr(material.id)}">${previewLabel}</button><a class="btn btn-outline btn-compact" href="${escapeAttr(driveUrl)}" target="_blank" rel="noopener noreferrer">Open in Drive ↗</a>`
+      : driveUrl
+        ? `<a class="btn btn-primary btn-compact" href="${escapeAttr(driveUrl)}" target="_blank" rel="noopener noreferrer">Open link ↗</a>`
     : `<span class="technical-material-unavailable">This resource link is unavailable.</span>`;
   return `<article class="technical-material-card">
     <div class="technical-material-card-top"><span class="technical-material-icon">${materialIcon(technicalMaterialKindIcon(material.kind))}</span><span class="technical-material-kind">${escapeHtml(label)}</span></div>
@@ -5227,14 +7038,43 @@ function openRequestedTechnicalMaterial() {
 function openTechnicalMaterialEditor() {
   if (!canManageTechnicalMaterials()) return showToast("You do not have permission to manage Technical materials.", "error");
   $("technicalMaterialForm")?.reset();
+  if ($("technicalMaterialId")) $("technicalMaterialId").value = "";
+  if ($("technicalMaterialCurrentFile")) $("technicalMaterialCurrentFile").textContent = "Choose a private upload or enter an existing link.";
+  if ($("technicalMaterialProgress")) { $("technicalMaterialProgress").hidden = true; $("technicalMaterialProgress").value = 0; }
+  if ($("technicalMaterialModalTitle")) $("technicalMaterialModalTitle").textContent = "Add Technical material";
+  if ($("saveTechnicalMaterialBtn")) $("saveTechnicalMaterialBtn").textContent = "Add to Technical materials";
   openModal("technicalMaterialModal");
   $("technicalMaterialTitle")?.focus();
 }
 
+function openTechnicalMaterialEdit(id) {
+  if (!canManageTechnicalMaterials()) return showToast("You do not have permission to manage Technical materials.", "error");
+  const material = state.technicalMaterials.find((item) => item.id === id);
+  if (!material) return;
+  $("technicalMaterialForm")?.reset();
+  $("technicalMaterialId").value = material.id;
+  $("technicalMaterialTitle").value = material.title || "";
+  $("technicalMaterialKind").value = material.kind || "material";
+  $("technicalMaterialUrl").value = material.url || "";
+  $("technicalMaterialDescription").value = material.description || "";
+  $("technicalMaterialFile").value = "";
+  $("technicalMaterialCurrentFile").textContent = material.driveFileName
+    ? `Current private Drive file: ${material.driveFileName}. Choose a new file to replace it.`
+    : "Choose a private upload or keep the existing link.";
+  if ($("technicalMaterialProgress")) { $("technicalMaterialProgress").hidden = true; $("technicalMaterialProgress").value = 0; }
+  $("technicalMaterialModalTitle").textContent = "Edit Technical material";
+  $("saveTechnicalMaterialBtn").textContent = "Save changes";
+  openModal("technicalMaterialModal");
+}
+
 function openTechnicalMaterialPreview(material) {
+  if (material?.driveFileId) {
+    void openDrivePreview("technicalMaterial", material.id, material.driveFileId, material.title, material.driveMimeType || "");
+    return;
+  }
   const driveUrl = normalizeGoogleDriveMaterialUrl(material?.url);
   const previewUrl = driveUrl ? googleDrivePreviewUrl(driveUrl) : "";
-  if (!previewUrl) return showToast("This Drive link cannot be previewed. Check that it is a supported Google Drive file link.", "error");
+  if (!previewUrl) return showToast("This Drive link cannot be previewed. Open the original link instead.", "error");
   $("technicalMaterialPreviewKind").textContent = technicalMaterialKindLabel(material.kind);
   $("technicalMaterialPreviewTitle").textContent = material.title || "Technical material";
   $("technicalMaterialPreviewFrame").title = `${material.title || "Technical material"} preview`;
@@ -5250,6 +7090,11 @@ function closeTechnicalMaterialPreview() {
 }
 
 async function handleTechnicalMaterialsClick(event) {
+  const editButton = event.target.closest("[data-edit-technical-material]");
+  if (editButton) {
+    openTechnicalMaterialEdit(editButton.dataset.editTechnicalMaterial);
+    return;
+  }
   const previewButton = event.target.closest("[data-preview-technical-material]");
   if (previewButton) {
     const material = state.technicalMaterials.find((item) => item.id === previewButton.dataset.previewTechnicalMaterial);
@@ -5278,47 +7123,94 @@ async function saveTechnicalMaterial(event) {
   const kind = $("technicalMaterialKind").value;
   const description = $("technicalMaterialDescription").value.trim();
   const url = normalizeGoogleDriveMaterialUrl($("technicalMaterialUrl").value.trim());
+  const file = $("technicalMaterialFile")?.files?.[0] || null;
+  const existing = state.technicalMaterials.find((item) => item.id === $("technicalMaterialId")?.value);
   if (!title) return showToast("Enter a title for this resource.", "error");
   if (!["video", "lecture", "book", "material"].includes(kind)) return showToast("Choose a valid resource type.", "error");
-  if (!url) return showToast("Enter a valid HTTPS Google Drive or Google Docs file link.", "error");
+  if ($("technicalMaterialUrl").value.trim() && !url) return showToast("Enter a valid Google Drive or Google Docs HTTPS sharing link.", "error");
+  if (!url && !file && !existing?.driveFileId) return showToast("Add an existing Drive link or choose a file to upload.", "error");
   const button = $("saveTechnicalMaterialBtn");
+  const materialId = $("technicalMaterialId")?.value || "";
+  const materialRef = materialId ? doc(db, "technicalMaterials", materialId) : doc(collection(db, "technicalMaterials"));
+  const progress = $("technicalMaterialProgress");
   if (button) {
     button.disabled = true;
-    button.textContent = "Adding…";
+    button.textContent = materialId ? "Saving…" : "Adding…";
   }
   try {
-    const materialRef = await addDoc(collection(db, "technicalMaterials"), {
-      title,
-      kind,
-      description,
-      url,
-      createdAt: serverTimestamp(),
-      createdByUid: state.user.uid,
-      createdByName: memberDisplayName(state.member, state.user).slice(0, 80)
-    });
     let notificationError = null;
-    try {
-      await notifyTechnicalTeamOfMaterial(materialRef.id, { title, kind, description });
-    } catch (error) {
-      notificationError = error;
+    let driveFields = file ? null : {
+      driveFileId: url ? "" : existing?.driveFileId || "",
+      driveFileName: url ? "" : existing?.driveFileName || "",
+      driveMimeType: url ? "" : existing?.driveMimeType || "",
+      driveSizeBytes: url ? 0 : Number(existing?.driveSizeBytes) || 0,
+      driveUploadedByUid: url ? "" : existing?.driveUploadedByUid || "",
+      driveUploadedAt: url ? "" : existing?.driveUploadedAt || ""
+    };
+    if (file) {
+      if (progress) { progress.hidden = false; progress.value = 0; }
+      const uploaded = await uploadDriveFile(auth, file, {
+        category: "technicalMaterial", targetRole: "tech",
+        sourceId: materialRef.id, sizeBytes: file.size
+      }, {
+        onProgress: (percent) => { if (progress) progress.value = percent; }
+      });
+      driveFields = {
+        driveFileId: uploaded.id,
+        driveFileName: uploaded.fileName,
+        driveMimeType: uploaded.mimeType,
+        driveSizeBytes: uploaded.sizeBytes,
+        driveUploadedByUid: state.user.uid,
+        driveUploadedAt: uploaded.uploadedAt || new Date().toISOString()
+      };
     }
+    const common = { title, kind, description, url: file ? "" : url, ...driveFields };
+    if (materialId) {
+      await updateDoc(materialRef, {
+        ...common, updatedAt: serverTimestamp(), updatedByUid: state.user.uid
+      });
+      try {
+        await notifyTechnicalTeamOfMaterial(materialId, { title, kind, description, driveFileId: driveFields.driveFileId }, true);
+      } catch (error) {
+        notificationError = error;
+      }
+    } else {
+      await setDoc(materialRef, {
+        ...common,
+        createdAt: serverTimestamp(),
+        createdByUid: state.user.uid,
+        createdByName: memberDisplayName(state.member, state.user).slice(0, 80)
+      });
+      try {
+        await notifyTechnicalTeamOfMaterial(materialRef.id, { title, kind, description, driveFileId: driveFields.driveFileId });
+      } catch (error) {
+        notificationError = error;
+      }
+    }
+    if (progress) progress.hidden = true;
     closeModal("technicalMaterialModal");
     $("technicalMaterialForm").reset();
-    showToast(notificationError
-      ? `Technical material added, but the Technical team inbox could not be notified: ${firebaseError(notificationError)}`
-      : "Technical material added and the Technical team has been notified.", notificationError ? "error" : "ok");
+    if ($("technicalMaterialId")) $("technicalMaterialId").value = "";
+    showToast(materialId
+      ? notificationError
+        ? `Technical material updated, but the Technical team inbox could not be notified: ${firebaseError(notificationError)}`
+        : "Technical material updated and the Technical team was notified."
+      : notificationError
+        ? `Technical material added, but the Technical team inbox could not be notified: ${firebaseError(notificationError)}`
+        : "Technical material added and the Technical team has been notified.", notificationError ? "error" : "ok");
     await loadTechnicalMaterials();
   } catch (error) {
     showToast(firebaseError(error), "error");
   } finally {
+    if (progress) progress.hidden = true;
     if (button) {
       button.disabled = false;
-      button.textContent = "Add to Technical materials";
+      button.textContent = $("technicalMaterialId")?.value ? "Save changes" : "Add to Technical materials";
     }
   }
 }
 
-async function notifyTechnicalTeamOfMaterial(materialId, material) {
+async function notifyTechnicalTeamOfMaterial(materialId, material, updated = false) {
   const [memberSnapshot, grantSnapshot] = await Promise.all([
     getDocs(query(collection(db, "teamMembers"), where("active", "==", true))),
     getDocs(query(collection(db, "dashboardAccessGrants"),
@@ -5328,7 +7220,8 @@ async function notifyTechnicalTeamOfMaterial(materialId, material) {
   const grants = grantSnapshot.docs.map((item) => ({ ...item.data(), id: item.id }));
   const recipients = memberSnapshot.docs.map((item) => ({ ...item.data(), uid: item.id })).filter((member) => {
     if (member.active !== true) return false;
-    if (member.role === "tech") return true;
+    if (member.role === "tech" || (Array.isArray(member.teamLeadRoles) && member.teamLeadRoles.includes("tech"))) return true;
+    if (member.role === "admin" && adminTeamAssignment(member)?.role === "tech") return true;
     return grants.some((grant) => grant.active === true
       && ["technicalMaterialsRead", "technicalMaterialsManage"].includes(grant.capability)
       && ((grant.scopeType === "user" && grant.scopeTarget === member.uid)
@@ -5337,8 +7230,8 @@ async function notifyTechnicalTeamOfMaterial(materialId, material) {
   });
   if (!recipients.length) return 0;
   const kindLabel = technicalMaterialKindLabel(material.kind).toLowerCase();
-  const notificationTitle = `New Technical material: ${material.title}`.slice(0, 120);
-  const notificationMessage = `A new ${kindLabel} was added to Technical materials.${material.description ? ` ${material.description}` : ""}`.slice(0, 1500);
+  const notificationTitle = `${updated ? "Updated" : "New"} Technical material: ${material.title}`.slice(0, 120);
+  const notificationMessage = `${updated ? `A ${kindLabel} in Technical materials was updated.` : `A new ${kindLabel} was added to Technical materials.`}${material.description ? ` ${material.description}` : ""}`.slice(0, 1500);
   return notifyInboxMembers(recipients, "technical_material", notificationTitle, notificationMessage, (member) => {
     const grant = grants.find((item) =>
       (item.scopeType === "user" && item.scopeTarget === member.uid)
@@ -5351,12 +7244,313 @@ async function notifyTechnicalTeamOfMaterial(materialId, material) {
   }, 1);
 }
 
+function roleResourceKindLabel(kind) {
+  return ({ link: "Link", video: "Video", book: "Book", document: "Document", tool: "Tool", inspiration: "Inspiration" })[kind] || "Link";
+}
+
+function roleResourceKindIcon(kind) {
+  return ({ link: "link", video: "play_circle", book: "menu_book", document: "description", tool: "build", inspiration: "auto_awesome" })[kind] || "open_in_new";
+}
+
+function roleResourceCardMarkup(resource) {
+  const url = normalizeHttpUrl(resource.url);
+  const sharedRoleTag = resource.targetRole === "leaders" && state.activeDashboardRole !== "leaders"
+    ? `<span class="role-resource-shared-badge">Leaders role library</span>`
+    : "";
+  const managerActions = canManageRoleResources(resource.targetRole)
+    ? `<button class="btn btn-outline btn-compact" type="button" data-edit-role-resource="${escapeAttr(resource.id)}">Edit</button><button class="btn btn-danger btn-compact" type="button" data-delete-role-resource="${escapeAttr(resource.id)}">Delete</button>`
+    : "";
+  return `<article class="role-resource-card">
+    <div class="role-resource-card-icon">${materialIcon(roleResourceKindIcon(resource.kind))}</div>
+    <div class="role-resource-copy">${sharedRoleTag}<span class="role-resource-kind">${escapeHtml(roleResourceKindLabel(resource.kind))}</span><h3>${escapeHtml(resource.title || "Team resource")}</h3><p>${escapeHtml(resource.description || "Shared with your team.")}</p></div>
+    <div class="role-resource-actions">${resource.driveFileId
+      ? `<button class="btn btn-primary btn-compact" type="button" data-preview-role-resource="${escapeAttr(resource.id)}">Preview ${materialIcon("visibility")}</button>`
+      : url ? `${googleDrivePreviewUrl(url) ? `<button class="btn btn-primary btn-compact" type="button" data-preview-role-link="${escapeAttr(resource.id)}">Preview ${materialIcon("visibility")}</button>` : ""}<a class="btn btn-outline btn-compact" href="${escapeAttr(url)}" target="_blank" rel="noopener noreferrer">Open resource ${materialIcon("open_in_new")}</a>`
+        : `<span class="technical-material-unavailable">This resource is unavailable.</span>`}${managerActions}</div>
+  </article>`;
+}
+
+function renderRoleResources(items = state.roleResources) {
+  const roleKey = state.activeDashboardRole;
+  if (!refs.roleResourcesGrid) return;
+  const roleName = ROLE_CONFIG[roleKey]?.label || "Team";
+  const includeLeadersLibrary = roleKey !== "leaders" && isPositionLeader(state.member);
+  if ($("roleResourcesTitle")) $("roleResourcesTitle").textContent = `Resources for ${roleName}${includeLeadersLibrary ? " + Leaders" : ""}`;
+  if ($("roleResourcesKicker")) $("roleResourcesKicker").textContent = includeLeadersLibrary
+    ? `${roleName} and Leaders resource libraries`
+    : `${roleName} resource library`;
+  if ($("roleResourcesHint")) $("roleResourcesHint").textContent = canManageRoleResources(roleKey)
+    ? includeLeadersLibrary
+      ? "Manage your team resources. Leaders-role resources are also shown here for position leaders."
+      : "Manage the links and materials your team uses. Members can open the resources here."
+    : includeLeadersLibrary
+      ? "Your team resources and the Leaders account-role library are available here."
+    : "Shared links and learning materials selected for your team.";
+  if (refs.roleResourcesCount) refs.roleResourcesCount.textContent = `${items.length} ${items.length === 1 ? "resource" : "resources"}`;
+  if ($("addRoleResourceBtn")) $("addRoleResourceBtn").classList.toggle("hidden", !canManageRoleResources(roleKey));
+  const permissionNote = state.roleResourceLoadWarning
+    ? `<div class="role-resource-permission-note" role="status">${escapeHtml(state.roleResourceLoadWarning)}</div>`
+    : "";
+  refs.roleResourcesGrid.innerHTML = `${permissionNote}${items.length
+    ? items.map(roleResourceCardMarkup).join("")
+    : `<div class="empty-state">${canManageRoleResources(roleKey) ? "No resources yet. Add the first link for this team." : "No resources have been shared with this team yet."}</div>`}`;
+}
+
+async function loadRoleResources(roleKey = state.activeDashboardRole) {
+  if (!refs.roleResourcesGrid) return;
+  if (!canReadRoleResources(roleKey)) {
+    state.roleResources = [];
+    state.roleResourceLoadWarning = "";
+    renderRoleResources([]);
+    return;
+  }
+  state.roleResourceLoadWarning = "";
+  refs.roleResourcesGrid.innerHTML = `<div class="empty-state">Loading ${escapeHtml(ROLE_CONFIG[roleKey]?.label || "team")} resources…</div>`;
+  try {
+    const resourceRoles = roleKey !== "leaders" && isPositionLeader(state.member)
+      ? [roleKey, "leaders"]
+      : [roleKey];
+    const results = await Promise.allSettled(resourceRoles.map((resourceRole) =>
+      getDocs(query(collection(db, "roleResources"), where("targetRole", "==", resourceRole)))));
+    if (state.activeDashboardRole !== roleKey) return;
+    if (results[0].status === "rejected") throw results[0].reason;
+    const snapshots = results.map((result) => result.status === "fulfilled" ? result.value : null);
+    if (resourceRoles.includes("leaders") && results[resourceRoles.indexOf("leaders")].status === "rejected") {
+      state.roleResourceLoadWarning = "Leaders resources were blocked by Firestore permissions. Publish the latest firestore.rules and confirm this member still has a position-leader role assigned.";
+    }
+    const combined = [];
+    resourceRoles.forEach((resourceRole, index) => {
+      if (!snapshots[index]) return;
+      const stored = new Map(snapshots[index].docs.map((item) => [item.id, { id: item.id, ...item.data() }]));
+      const defaults = (DEFAULT_ROLE_RESOURCES[resourceRole] || []).flatMap((starter) => {
+        const override = stored.get(starter.id);
+        if (override?.active === false) return [];
+        stored.delete(starter.id);
+        return [{ ...starter, ...(override || {}), id: starter.id, targetRole: resourceRole, active: true, storedInFirestore: Boolean(override) }];
+      });
+      const custom = [...stored.values()].filter((item) => item.active !== false)
+        .map((item) => ({ ...item, storedInFirestore: true }));
+      combined.push(...defaults, ...custom);
+    });
+    state.roleResources = combined.sort((a, b) => {
+      const aDate = a.createdAt?.toDate ? a.createdAt.toDate().getTime() : 0;
+      const bDate = b.createdAt?.toDate ? b.createdAt.toDate().getTime() : 0;
+      return bDate - aDate || String(a.title || "").localeCompare(String(b.title || ""));
+    });
+    renderRoleResources(state.roleResources);
+  } catch (error) {
+    if (state.activeDashboardRole !== roleKey) return;
+    state.roleResources = [];
+    state.roleResourceLoadWarning = "";
+    refs.roleResourcesGrid.innerHTML = `<div class="empty-state">Team resources could not be loaded. Check the deployed Firestore rules.</div>`;
+    showToast(firebaseError(error), "error");
+  }
+}
+
+function openRoleResourceEditor(resource = null) {
+  const activeRole = state.activeDashboardRole;
+  if (!canManageRoleResources(activeRole)) return showToast("Resource management access is required.", "error");
+  const form = $("roleResourceForm");
+  if (!form) return;
+  form.reset();
+  const target = $("roleResourceTargetRole");
+  const roles = ASSIGNABLE_DASHBOARD_ROLES.filter(canManageRoleResources);
+  target.innerHTML = roles.map((roleKey) => `<option value="${escapeAttr(roleKey)}">${escapeHtml(ROLE_CONFIG[roleKey].label)}</option>`).join("");
+  target.disabled = Boolean(resource);
+  target.value = resource?.targetRole || (roles.includes(activeRole) ? activeRole : roles[0] || "");
+  $("roleResourceId").value = resource?.id || "";
+  $("roleResourceStored").value = resource?.storedInFirestore ? "true" : "false";
+  $("roleResourceTitle").value = resource?.title || "";
+  $("roleResourceUrl").value = resource?.url || "";
+  $("roleResourceDescription").value = resource?.description || "";
+  $("roleResourceKind").value = resource?.kind || "link";
+  $("roleResourceFile").value = "";
+  $("roleResourceCurrentFile").textContent = resource?.driveFileName
+    ? `Current private Drive file: ${resource.driveFileName}. Choose a new file to replace it.`
+    : "Choose a private upload or enter an existing link.";
+  if ($("roleResourceProgress")) { $("roleResourceProgress").hidden = true; $("roleResourceProgress").value = 0; }
+  $("roleResourceModalTitle").textContent = resource ? "Edit team resource" : "Add team resource";
+  $("saveRoleResourceBtn").textContent = resource ? "Save changes" : "Add resource";
+  $("roleResourcePermissionHint").textContent = "Shared with the selected team and members granted access to its library.";
+  openModal("roleResourceModal");
+  $("roleResourceTitle")?.focus();
+}
+
+async function notifyRoleResourceAudience(resourceId, resource, updated = false) {
+  const snapshot = await getDocs(query(collection(db, "teamMembers"), where("active", "==", true)));
+  const recipients = snapshot.docs.map((item) => ({ uid: item.id, ...item.data() })).filter((member) => {
+    if (member.role === resource.targetRole
+      || (Array.isArray(member.teamLeadRoles) && member.teamLeadRoles.includes(resource.targetRole))
+      || (Array.isArray(member.dashboardRoles) && member.dashboardRoles.includes(resource.targetRole))
+      || (member.role === "admin" && adminTeamAssignment(member)?.role === resource.targetRole)
+      || (resource.targetRole === "leaders" && isPositionLeader(member))) return true;
+    return false;
+  });
+  const notificationKey = `role-resource_${resourceId}_${Date.now()}`;
+  return notifyInboxMembers(
+    recipients,
+    "role_resource",
+    `${updated ? "Updated" : "New"} ${ROLE_CONFIG[resource.targetRole]?.label || "team"} resource: ${resource.title}`,
+    updated ? `${resource.title} was updated in your team resources.` : `${resource.title} was added to your team resources.`,
+    { roleResourceId: resourceId, roleResourceRole: resource.targetRole },
+    3,
+    notificationKey
+  );
+}
+
+async function saveRoleResource(event) {
+  event.preventDefault();
+  const id = $("roleResourceId")?.value || "";
+  const targetRole = $("roleResourceTargetRole")?.value || "";
+  if (!canManageRoleResources(targetRole)) return showToast("You can only manage resources for a team you lead.", "error");
+  const title = $("roleResourceTitle")?.value.trim() || "";
+  const description = $("roleResourceDescription")?.value.trim() || "";
+  const url = normalizeHttpUrl($("roleResourceUrl")?.value.trim());
+  const file = $("roleResourceFile")?.files?.[0] || null;
+  const kind = $("roleResourceKind")?.value || "";
+  if (title.length < 1 || title.length > 120) return showToast("Use a resource title up to 120 characters.", "error");
+  const currentResource = id ? state.roleResources.find((item) => item.id === id) : null;
+  if (!url && !file && !currentResource?.driveFileId) return showToast("Add an existing link or choose a private file to upload.", "error");
+  if (url && new URL(url).protocol !== "https:") return showToast("Enter a valid HTTPS link.", "error");
+  if (description.length > 600) return showToast("Keep the description under 600 characters.", "error");
+  if (!["link", "video", "book", "document", "tool", "inspiration"].includes(kind)) return showToast("Choose a valid resource type.", "error");
+  const button = $("saveRoleResourceBtn");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Saving…";
+  }
+  try {
+    const resourceRef = id ? doc(db, "roleResources", id) : doc(collection(db, "roleResources"));
+    const hasStoredResource = $("roleResourceStored")?.value === "true";
+    const existing = id && hasStoredResource ? await getDoc(resourceRef) : null;
+    const oldData = existing?.exists() ? existing.data() : null;
+    if (oldData && !canManageRoleResources(oldData.targetRole)) {
+      throw new Error("You do not manage the team this resource currently belongs to.");
+    }
+    let driveFields = file ? null : {
+      driveFileId: url ? "" : oldData?.driveFileId || "",
+      driveFileName: url ? "" : oldData?.driveFileName || "",
+      driveMimeType: url ? "" : oldData?.driveMimeType || "",
+      driveSizeBytes: url ? 0 : Number(oldData?.driveSizeBytes) || 0,
+      driveUploadedByUid: url ? "" : oldData?.driveUploadedByUid || "",
+      driveUploadedAt: url ? "" : oldData?.driveUploadedAt || ""
+    };
+    const progress = $("roleResourceProgress");
+    if (file) {
+      if (progress) { progress.hidden = false; progress.value = 0; }
+      const uploaded = await uploadDriveFile(auth, file, {
+        category: "roleResource", targetRole,
+        sourceId: resourceRef.id, sizeBytes: file.size
+      }, {
+        onProgress: (percent) => { if (progress) progress.value = percent; }
+      });
+      driveFields = {
+        driveFileId: uploaded.id,
+        driveFileName: uploaded.fileName,
+        driveMimeType: uploaded.mimeType,
+        driveSizeBytes: uploaded.sizeBytes,
+        driveUploadedByUid: state.user.uid,
+        driveUploadedAt: uploaded.uploadedAt || new Date().toISOString()
+      };
+    }
+    const data = {
+      targetRole, title, description, url: file ? "" : url, kind, active: true, ...driveFields,
+      createdByUid: oldData?.createdByUid || state.user.uid,
+      createdAt: oldData?.createdAt || serverTimestamp(),
+      updatedByUid: state.user.uid, updatedAt: serverTimestamp()
+    };
+    await setDoc(resourceRef, data);
+    let notificationError = null;
+    try {
+      await notifyRoleResourceAudience(resourceRef.id, data, Boolean(oldData));
+    } catch (error) { notificationError = error; }
+    closeModal("roleResourceModal");
+    showToast(notificationError
+      ? `Resource saved, but the team inbox could not be notified: ${firebaseError(notificationError)}`
+      : oldData ? "Resource updated and the team was notified." : "Resource added and the team was notified.",
+    notificationError ? "error" : "ok");
+    await loadRoleResources(targetRole);
+  } catch (error) {
+    showToast(firebaseError(error), "error");
+  } finally {
+    if ($("roleResourceProgress")) $("roleResourceProgress").hidden = true;
+    if (button) {
+      button.disabled = false;
+      button.textContent = id ? "Save changes" : "Add resource";
+    }
+  }
+}
+
+async function handleRoleResourcesClick(event) {
+  const previewButton = event.target.closest("[data-preview-role-resource]");
+  if (previewButton) {
+    const resource = state.roleResources.find((item) => item.id === previewButton.dataset.previewRoleResource);
+    if (resource?.driveFileId) {
+      void openDrivePreview("roleResource", resource.id, resource.driveFileId, resource.title, resource.driveMimeType || "");
+    }
+    return;
+  }
+  const linkPreviewButton = event.target.closest("[data-preview-role-link]");
+  if (linkPreviewButton) {
+    const resource = state.roleResources.find((item) => item.id === linkPreviewButton.dataset.previewRoleLink);
+    if (resource?.url) openLegacyDrivePreview(resource.url, resource.title);
+    return;
+  }
+  const editButton = event.target.closest("[data-edit-role-resource]");
+  if (editButton) {
+    const resource = state.roleResources.find((item) => item.id === editButton.dataset.editRoleResource);
+    if (resource) openRoleResourceEditor(resource);
+    return;
+  }
+  const deleteButton = event.target.closest("[data-delete-role-resource]");
+  if (!deleteButton) return;
+  const resource = state.roleResources.find((item) => item.id === deleteButton.dataset.deleteRoleResource);
+  if (!resource || !canManageRoleResources(resource.targetRole)) return showToast("You do not have permission to delete this resource.", "error");
+  if (!window.confirm(`Remove “${resource.title}” from ${ROLE_CONFIG[resource.targetRole]?.label || "the team"} resources?`)) return;
+  try {
+    if (resource.id.startsWith("starter-")) {
+      if (resource.storedInFirestore) {
+        await updateDoc(doc(db, "roleResources", resource.id), { active: false, updatedByUid: state.user.uid, updatedAt: serverTimestamp() });
+      } else {
+        await setDoc(doc(db, "roleResources", resource.id), {
+          targetRole: resource.targetRole, title: resource.title, description: resource.description || "",
+          url: resource.url, kind: resource.kind || "link", active: false,
+          createdByUid: state.user.uid, createdAt: serverTimestamp(),
+          updatedByUid: state.user.uid, updatedAt: serverTimestamp()
+        });
+      }
+    } else {
+      await deleteDoc(doc(db, "roleResources", resource.id));
+    }
+    showToast("Resource removed from the team library.");
+    await loadRoleResources(resource.targetRole);
+  } catch (error) {
+    showToast(firebaseError(error), "error");
+  }
+}
+
+async function loadSessionLibrary() {
+  const root = $("sessionLibraryList");
+  if (!root || !hasDashboardAccess("sessionsRead")) return;
+  try {
+    const base = collection(db, "nawrasOnlineSessions");
+    const snapshots = await Promise.all(sessionQueriesForMember(base, state.member).map((ref) => getDocs(ref)));
+    const sessions = mergeMemberSessions(snapshots, state.member).sort((a, b) => sortTimestampDesc(a.startsAt, b.startsAt));
+    root.innerHTML = sessions.length ? sessions.map((session) => `<article class="session-library-card"><div><strong>${escapeHtml(session.title || "Session")}</strong><p>${escapeHtml(formatDate(session.startsAt))} · ${escapeHtml(session.status || "scheduled")}</p></div><a class="btn btn-outline btn-compact" href="nawras-online.html?session=${encodeURIComponent(session.id)}">Open</a></article>`).join("") : `<div class="empty-state">No sessions yet.</div>`;
+  } catch (error) {
+    root.innerHTML = `<div class="empty-state">Sessions could not be loaded.</div>`;
+    showToast(firebaseError(error), "error");
+  }
+}
+
 function dashboardSectionsFor(roleKey) {
   const sections = [
     { id: "overview", label: "Overview", icon: "dashboard", group: "Workspace", panels: ["overview"] },
     { id: "calendar", label: "My calendar", icon: "calendar_month", group: "Workspace", panels: ["calendar"] },
     { id: "my-courses", label: "My courses", icon: "menu_book", group: "Workspace", panels: ["assigned-courses"] },
     { id: "tasks", label: "Tasks", icon: "task_alt", group: "Workspace", panels: ["tasks"] },
+    { id: "ask-founder", label: "Ask Founder", icon: "support_agent", group: "Workspace", panels: ["founder"] },
+    { id: "cross-team-work", label: "Cross-Team Work", icon: "conversion_path", group: "Workspace", panels: ["cross-team-work"] },
     { id: "questions", label: "Questions", icon: "contact_support", group: "Workspace", panels: ["questions"] },
     { id: "inbox", label: "My inbox", icon: "inbox", group: "Workspace", panels: ["inbox"] },
     { id: "my-ratings", label: "My rating sheet", icon: "fact_check", group: "Workspace", panels: ["my-ratings"] },
@@ -5369,21 +7563,23 @@ function dashboardSectionsFor(roleKey) {
     sections.splice(2, 0, { id: "technical-materials", label: "Technical materials", icon: "school", group: "Workspace", panels: ["technical-materials"] });
   }
   if (state.role === "admin" && roleKey === "admin") {
-    sections.push({ id: "team-members", label: "Team members", icon: "groups", group: "Administration", panels: ["team-members"] });
     sections.push({ id: "dashboard-access", label: "Dashboard access", icon: "admin_panel_settings", group: "Administration", panels: ["dashboard-access"] });
+  }
+  if (canReadAllTeam()) {
+    sections.push({ id: "team-members", label: "Team members", icon: "groups", group: "Team", panels: ["team-members"] });
+  }
+  if (canReadAttendance()) {
     sections.push({ id: "attendance", label: "Attendance", icon: "event_available", group: "Administration", panels: ["attendance"] });
   }
-  if (["admin", "leaders"].includes(state.role) && ["admin", "leaders"].includes(roleKey)) {
+  if (hasDashboardAccess("sessionsRead")) {
+    sections.push({ id: "sessions", label: "Sessions", icon: "video_call", group: "Dashboard tools", panels: ["sessions"] });
+  }
+  if (canReadAllRatings() || hasDashboardAccess("xpReset") || (state.role === "leaders" && roleKey === "leaders")) {
     sections.push({ id: "ratings", label: "Ratings sheet", icon: "fact_check", group: "Workspace", panels: ["ratings"] });
   }
-  if (state.role !== "admin" && currentTeamLeadRoles().length) {
-    sections.push({ id: "managed-team", label: "Managed team", icon: "groups", group: "Team leadership", panels: ["team-members"] });
-    if (state.role !== "leaders") {
-      sections.push({ id: "managed-ratings", label: "Team ratings", icon: "fact_check", group: "Team leadership", panels: ["ratings"] });
-    }
-  }
-  if (canManageContent() && ["admin", "tech"].includes(roleKey)) {
-    sections.push({ id: "management", label: "Manage content", icon: "settings", group: "Administration", panels: ["management"] });
+  if (state.role !== "admin" && currentTeamLeadRoles().includes(roleKey)) {
+    if (!canReadAllTeam()) sections.push({ id: "managed-team", label: "Managed team", icon: "groups", group: "Team leadership", panels: ["team-members"] });
+    if (!canReadAllRatings()) sections.push({ id: "managed-ratings", label: "Team rating sheets", icon: "fact_check", group: "Team leadership", panels: ["ratings"] });
   }
   if (canReadCourses()) {
     sections.push({ id: "courses", label: canManageCourses() ? "Manage courses" : "Course library", icon: "library_books", group: "Dashboard tools", panels: ["courses"] });
@@ -5394,22 +7590,28 @@ function dashboardSectionsFor(roleKey) {
   if (canReadFormResponses()) {
     sections.push({ id: "responses", label: "Form submissions", icon: "rule", group: "Dashboard tools", panels: ["responses"] });
   }
-  if (canViewDesignerResources(roleKey)) {
-    sections.push({ id: "resources", label: "Design resources", icon: "palette", group: "Resources", panels: ["designer-resources"] });
+  if (canReadRoleResources(roleKey)) {
+    sections.push({ id: "resources", label: roleKey === "designers" ? "Design resources" : "Team resources", icon: "folder_open", group: "Resources", panels: ["role-resources"] });
   }
   return sections;
 }
 
 function dashboardRolesForMember() {
   if (state.role === "admin") return ROLE_ORDER;
-  if (state.role !== "user") return [state.role].filter((roleKey) => Boolean(ROLE_CONFIG[roleKey]));
-  const assigned = Array.isArray(state.member?.dashboardRoles)
+  const assignedDashboards = state.role === "user" && Array.isArray(state.member?.dashboardRoles)
     ? state.member.dashboardRoles.filter((roleKey) => ASSIGNABLE_DASHBOARD_ROLES.includes(roleKey))
     : [];
-  return assigned.length ? [...new Set(assigned)] : ["user"];
+  const baseRole = ROLE_CONFIG[state.role] ? [state.role] : ["user"];
+  const grantedResources = ASSIGNABLE_DASHBOARD_ROLES.filter((roleKey) => hasDashboardAccess(resourceCapability(roleKey)));
+  return [...new Set([...baseRole, ...assignedDashboards, ...currentTeamLeadRoles(), ...grantedResources])]
+    .filter((roleKey) => ASSIGNABLE_DASHBOARD_ROLES.includes(roleKey));
 }
 
 function renderDashboard() {
+  const teamHint = document.querySelector("#teamMembersPanel .panel-heading .panel-hint");
+  if (teamHint) teamHint.textContent = "Members, assignments and XP.";
+  const ratingsHint = document.querySelector("#ratingsPanel .panel-heading .panel-hint");
+  if (ratingsHint) ratingsHint.textContent = "Choose a member to view or edit their ratings.";
   const visibleRoles = dashboardRolesForMember();
   if (!visibleRoles.includes(state.activeDashboardRole)) {
     state.activeDashboardRole = visibleRoles[0] || state.role || "user";
@@ -5418,17 +7620,22 @@ function renderDashboard() {
   if (refs.dashboard) refs.dashboard.dataset.roleTheme = ROLE_ART[themeRole] ? themeRole : "public";
   // Keep the dashboard header compact; the overview carries the useful content.
   const role = ROLE_CONFIG[state.activeDashboardRole || state.role] || ROLE_CONFIG.public;
-  if ($("dashboardEyebrow")) $("dashboardEyebrow").textContent = `NAWRAS EDU · ${role.eyebrow}`;
-  if ($("dashboardTitle")) $("dashboardTitle").textContent = `${role.label} dashboard`;
+  const isRoleLeader = isRoleLeaderForDashboard(state.activeDashboardRole);
+  if ($("dashboardEyebrow")) $("dashboardEyebrow").textContent = isRoleLeader
+    ? `NAWRAS EDU · ${role.label.toUpperCase()} POSITION LEADER`
+    : `NAWRAS EDU · ${role.eyebrow}`;
+  if ($("dashboardTitle")) $("dashboardTitle").textContent = `${role.label}${isRoleLeader ? " position leader" : state.activeDashboardRole === "leaders" ? " role" : ""} dashboard`;
+  if ($("teamWelcome")) $("teamWelcome").textContent = `${memberDisplayName(state.member, state.user)} · Account role: ${ROLE_CONFIG[state.role]?.label || state.role}${isRoleLeader ? ` · Position: ${role.label} leader` : ""}${state.member?.universityTag ? ` · ${universityLabel(state.member.universityTag)}` : ""}`;
   if ($("addCourseBtn")) $("addCourseBtn").classList.toggle("hidden", !canManageCourses());
   if ($("addFormBtn")) $("addFormBtn").classList.toggle("hidden", !canManageForms());
   if ($("addTechnicalMaterialBtn")) $("addTechnicalMaterialBtn").classList.toggle("hidden", !canManageTechnicalMaterials());
   if (refs.roleWorkspace) {
-    refs.roleWorkspace.innerHTML = `<div class="role-workspace-heading"><div><span class="panel-kicker">${escapeHtml(role.label)} tools</span><h2>${escapeHtml(role.description)}</h2></div><span class="role-badge">${escapeHtml(ROLE_CONFIG[state.role]?.label || state.role)}</span></div><div class="role-tool-grid">${role.tools.map((tool, index) => `<article class="role-tool-card"><span class="role-tool-number">${String(index + 1).padStart(2, "0")}</span><h3>${escapeHtml(tool)}</h3><p>${index === 0 && state.activeDashboardRole === "tech" ? "Open Technical materials from the dashboard menu to browse and preview shared resources." : "This dashboard area is ready for the next tool you add."}</p></article>`).join("")}</div>`;
+    refs.roleWorkspace.innerHTML = "";
+    refs.roleWorkspace.classList.add("hidden");
   }
   if (refs.roleDashboardNav) {
     refs.roleDashboardNav.classList.toggle("hidden", visibleRoles.length < 2);
-    refs.roleDashboardNav.innerHTML = visibleRoles.map((roleKey) => `<button type="button" class="role-tab ${roleKey === state.activeDashboardRole ? "active" : ""}" data-dashboard-role="${roleKey}">${escapeHtml(ROLE_CONFIG[roleKey].label)}</button>`).join("");
+    refs.roleDashboardNav.innerHTML = visibleRoles.map((roleKey) => `<button type="button" class="role-tab ${roleKey === state.activeDashboardRole ? "active" : ""}" data-dashboard-role="${roleKey}">${escapeHtml(ROLE_CONFIG[roleKey].label)}${isRoleLeaderForDashboard(roleKey) ? " · Position leader" : roleKey === "leaders" ? " · Account role" : ""}</button>`).join("");
     refs.roleDashboardNav.querySelectorAll("[data-dashboard-role]").forEach((button) => button.addEventListener("click", () => {
       state.activeDashboardRole = button.dataset.dashboardRole;
       state.activeDashboardSection = "overview";
@@ -5437,6 +7644,7 @@ function renderDashboard() {
       loadTeamQuestions();
       loadTasks();
       loadLeaderboard();
+      if (canReadTechnicalMaterials()) loadTechnicalMaterials();
     }));
   }
   flattenManagementPanels();
@@ -5455,8 +7663,14 @@ function renderDashboard() {
   }
   const visiblePanelIds = new Set(activeSection.panels);
   dashboardPanelNodes().forEach((panel) => panel.classList.toggle("hidden", !visiblePanelIds.has(panel.dataset.dashboardPanel)));
+  if (activeSection.id === "ask-founder") void loadFounderQuestions();
+  if (activeSection.id === "cross-team-work") void crossTeamWork.load();
+  const crossTeamCreateButton = $("crossTeamCreateButton");
+  if (crossTeamCreateButton) crossTeamCreateButton.classList.toggle("hidden",
+    !(state.role === "admin" || currentTeamLeadRoles().includes("event")));
   personalPlanner?.refreshOverview();
   setupDashboardLayout();
+  if (canReadRoleResources(state.activeDashboardRole)) void loadRoleResources(state.activeDashboardRole);
 }
 
 upgradeStaticIcons();
@@ -5470,6 +7684,7 @@ onAuthStateChanged(auth, async (user) => {
   state.courseAssignments = [];
   state.memberForms = [];
   state.technicalMaterials = [];
+  state.roleResources = [];
   state.dashboardCapabilities = {};
   state.dashboardGrants = [];
   if (state.inboxUnsubscribe) state.inboxUnsubscribe();
@@ -5483,6 +7698,7 @@ onAuthStateChanged(auth, async (user) => {
   state.leaderboardMembers = [];
   state.tasks = [];
   state.taskSubmissions = {};
+  crossTeamWork.reset();
   state.myRating = null;
   state.chatPartner = null;
   state.chatThreads = [];
@@ -5520,14 +7736,21 @@ onAuthStateChanged(auth, async (user) => {
       state.role = role;
       state.member = { uid: member.id, id: member.id, ...memberData };
       await loadDashboardAccess();
-      state.activeDashboardRole = role === "admin" ? "admin" : (role === "user" ? (dashboardRolesForMember()[0] || "user") : role);
-      const requestedSection = new URLSearchParams(window.location.search).get("view");
-      state.activeDashboardSection = new URLSearchParams(window.location.search).get("rating") === "mine"
+      const routeParams = new URLSearchParams(window.location.search);
+      const availableDashboardRoles = dashboardRolesForMember();
+      const requestedRole = routeParams.get("role");
+      const defaultDashboardRole = role === "admin"
+        ? "admin"
+        : role === "leaders"
+          ? "leaders"
+          : currentTeamLeadRoles()[0] || (role === "user" ? (availableDashboardRoles[0] || "user") : role);
+      state.activeDashboardRole = availableDashboardRoles.includes(requestedRole) ? requestedRole : defaultDashboardRole;
+      const requestedSection = routeParams.get("view") === "managed-tasks" ? "tasks" : routeParams.get("view");
+      state.activeDashboardSection = routeParams.get("rating") === "mine"
         ? "my-ratings"
         : (dashboardSectionsFor(state.activeDashboardRole).some((section) => section.id === requestedSection)
           ? requestedSection : "overview");
       updateProfileSummary();
-      await preparePushNotifications();
       if (refs.adminLoginView) refs.adminLoginView.classList.add("hidden");
       if (refs.dashboard) refs.dashboard.classList.remove("hidden");
       if (page === "admin") {
@@ -5535,7 +7758,7 @@ onAuthStateChanged(auth, async (user) => {
           db, member: state.member,
           getState: () => ({
             ...state,
-            tasks: state.role === "admin" ? state.tasks.filter(canSubmitTaskAsCurrentUser) : state.tasks,
+            tasks: state.tasks.filter(canSubmitTaskAsCurrentUser),
             sections: dashboardSectionsFor(state.activeDashboardRole)
           }),
           navigate: (section) => {
@@ -5554,7 +7777,9 @@ onAuthStateChanged(auth, async (user) => {
         await loadTasks();
         await loadTeamMembers();
         await loadDashboardGrantAdmin();
-        if (state.role === "admin") await loadAttendanceSessions();
+        if (canReadAttendance()) await loadAttendanceSessions();
+        await loadSessionLibrary();
+        $("refreshSessionLibrary")?.addEventListener("click", loadSessionLibrary);
         await loadLeaderboard();
         await loadMemberChat();
         if (canReadCourses() || canReadManagedForms()) await loadTeamData();

@@ -1,6 +1,39 @@
 {
   "indexes": [
     {
+      "collectionGroup": "nawrasOnlineSessions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "audienceRole", "order": "ASCENDING" },
+        { "fieldPath": "targetMemberUids", "arrayConfig": "CONTAINS" }
+      ]
+    },
+    {
+      "collectionGroup": "nawrasOnlineSessions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "audienceRole", "order": "ASCENDING" },
+        { "fieldPath": "audienceUniversityTag", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "dashboardAccessGrants",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "scopeType", "order": "ASCENDING" },
+        { "fieldPath": "scopeTarget", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "dashboardAccessGrants",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "scopeType", "order": "ASCENDING" },
+        { "fieldPath": "scopeTarget", "order": "ASCENDING" },
+        { "fieldPath": "active", "order": "ASCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "dashboardAccessGrants",
       "queryScope": "COLLECTION",
       "fields": [
@@ -17,87 +50,103 @@
       ]
     },
     {
-      "collectionGroup": "nawrasOnlineSessions",
-      "queryScope": "COLLECTION",
-      "fields": [
-        {
-          "fieldPath": "audienceRole",
-          "order": "ASCENDING"
-        },
-        {
-          "fieldPath": "audienceUniversityTag",
-          "order": "ASCENDING"
-        }
-      ]
-    },
-    {
       "collectionGroup": "memberRatings",
       "queryScope": "COLLECTION",
       "fields": [
-        {
-          "fieldPath": "active",
-          "order": "ASCENDING"
-        },
-        {
-          "fieldPath": "universityTag",
-          "order": "ASCENDING"
-        }
+        { "fieldPath": "active", "order": "ASCENDING" },
+        { "fieldPath": "universityTag", "order": "ASCENDING" }
       ]
     },
     {
       "collectionGroup": "forms",
       "queryScope": "COLLECTION",
       "fields": [
-        {
-          "fieldPath": "audienceType",
-          "order": "ASCENDING"
-        },
-        {
-          "fieldPath": "published",
-          "order": "ASCENDING"
-        },
-        {
-          "fieldPath": "createdAt",
-          "order": "DESCENDING"
-        }
+        { "fieldPath": "audienceType", "order": "ASCENDING" },
+        { "fieldPath": "published", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
       ]
     },
     {
       "collectionGroup": "forms",
       "queryScope": "COLLECTION",
       "fields": [
-        {
-          "fieldPath": "audienceType",
-          "order": "ASCENDING"
-        },
-        {
-          "fieldPath": "published",
-          "order": "ASCENDING"
-        },
-        {
-          "fieldPath": "targetRole",
-          "order": "ASCENDING"
-        }
+        { "fieldPath": "audienceType", "order": "ASCENDING" },
+        { "fieldPath": "published", "order": "ASCENDING" },
+        { "fieldPath": "targetRole", "order": "ASCENDING" }
       ]
     },
     {
       "collectionGroup": "forms",
       "queryScope": "COLLECTION",
       "fields": [
-        {
-          "fieldPath": "audienceType",
-          "order": "ASCENDING"
-        },
-        {
-          "fieldPath": "published",
-          "order": "ASCENDING"
-        },
-        {
-          "fieldPath": "targetUniversityTag",
-          "order": "ASCENDING"
-        }
+        { "fieldPath": "audienceType", "order": "ASCENDING" },
+        { "fieldPath": "published", "order": "ASCENDING" },
+        { "fieldPath": "targetUniversityTag", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "tasks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "targetRole", "order": "ASCENDING" },
+        { "fieldPath": "targetUniversityTag", "order": "ASCENDING" },
+        { "fieldPath": "audienceMode", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "tasks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "createdBy", "order": "ASCENDING" },
+        { "fieldPath": "targetUniversityTag", "order": "ASCENDING" }
       ]
     }
   ],
-  "fieldOverrides": []
+  "fieldOverrides": [
+    {
+      "collectionGroup": "submissions",
+      "fieldPath": "submitterUid",
+      "indexes": [
+        { "order": "ASCENDING", "queryScope": "COLLECTION" },
+        { "order": "DESCENDING", "queryScope": "COLLECTION" },
+        { "order": "ASCENDING", "queryScope": "COLLECTION_GROUP" }
+      ]
+    },
+    {
+      "collectionGroup": "notifications",
+      "fieldPath": "actorUid",
+      "indexes": [
+        { "order": "ASCENDING", "queryScope": "COLLECTION" },
+        { "order": "DESCENDING", "queryScope": "COLLECTION" },
+        { "order": "ASCENDING", "queryScope": "COLLECTION_GROUP" }
+      ]
+    },
+    {
+      "collectionGroup": "attendanceVisits",
+      "fieldPath": "uid",
+      "indexes": [
+        { "order": "ASCENDING", "queryScope": "COLLECTION" },
+        { "order": "DESCENDING", "queryScope": "COLLECTION" },
+        { "order": "ASCENDING", "queryScope": "COLLECTION_GROUP" }
+      ]
+    },
+    {
+      "collectionGroup": "hands",
+      "fieldPath": "uid",
+      "indexes": [
+        { "order": "ASCENDING", "queryScope": "COLLECTION" },
+        { "order": "DESCENDING", "queryScope": "COLLECTION" },
+        { "order": "ASCENDING", "queryScope": "COLLECTION_GROUP" }
+      ]
+    },
+    {
+      "collectionGroup": "attendance",
+      "fieldPath": "uid",
+      "indexes": [
+        { "order": "ASCENDING", "queryScope": "COLLECTION" },
+        { "order": "DESCENDING", "queryScope": "COLLECTION" },
+        { "order": "ASCENDING", "queryScope": "COLLECTION_GROUP" }
+      ]
+    }
+  ]
 }
